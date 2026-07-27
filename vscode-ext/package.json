@@ -1,0 +1,48 @@
+{
+  "name": "arc-language",
+  "displayName": "Arc Language Support",
+  "description": "Syntax highlighting and language support for the Arc programming language",
+  "version": "0.1.0",
+  "publisher": "arc-project",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "arc",
+        "aliases": [
+          "Arc",
+          "arc"
+        ],
+        "extensions": [
+          ".arc"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "arc",
+        "scopeName": "source.arc",
+        "path": "./syntaxes/arc.tmLanguage.json"
+      }
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ital87/arc.git"
+  },
+  "keywords": [
+    "arc",
+    "systems",
+    "language",
+    "compiled",
+    "llvm"
+  ]
+}
+

@@ -1,0 +1,50 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+dist/
+
+# Compiled binaries
+arc
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.lib
+*.dll
+*.exe
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.code-workspace
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# LLVM artifacts
+*.ll
+*.bc
+
+# Compiled test programs
+minimal
+test2
+test3
+simple
+add
+factorial
+test_param
+
