@@ -75,6 +75,7 @@ enum class TokenType {
     KW_CASE,
     KW_DEFAULT,
     KW_CONST,
+    KW_SIZEOF,
 
     PLUS,
     MINUS,
@@ -86,8 +87,10 @@ enum class TokenType {
     NOT_EQUAL,
     LESS,
     LESS_EQUAL,
+    LESS_LESS,
     GREATER,
     GREATER_EQUAL,
+    GREATER_GREATER,
     AMPERSAND,
     PIPE,
     CARET,
@@ -118,6 +121,7 @@ struct Token {
     std::string value;
     int line;
     int column;
+    std::string file;
 
     Token();
     Token(TokenType type, const std::string& lexeme, const std::string& value, int line, int column);
@@ -165,6 +169,7 @@ std::string Token::typeToString() const {
         case TokenType::KW_CASE:        return "KW_CASE";
         case TokenType::KW_DEFAULT:     return "KW_DEFAULT";
         case TokenType::KW_CONST:       return "KW_CONST";
+        case TokenType::KW_SIZEOF:      return "KW_SIZEOF";
 
         case TokenType::PLUS:           return "PLUS";
         case TokenType::MINUS:          return "MINUS";
@@ -176,8 +181,10 @@ std::string Token::typeToString() const {
         case TokenType::NOT_EQUAL:      return "NOT_EQUAL";
         case TokenType::LESS:           return "LESS";
         case TokenType::LESS_EQUAL:     return "LESS_EQUAL";
+        case TokenType::LESS_LESS:      return "LESS_LESS";
         case TokenType::GREATER:        return "GREATER";
         case TokenType::GREATER_EQUAL:  return "GREATER_EQUAL";
+        case TokenType::GREATER_GREATER: return "GREATER_GREATER";
         case TokenType::AMPERSAND:      return "AMPERSAND";
         case TokenType::PIPE:           return "PIPE";
         case TokenType::CARET:          return "CARET";
@@ -267,6 +274,7 @@ const std::unordered_map<std::string, TokenType> Lexer::keywords = {
     {"case", TokenType::KW_CASE},
     {"default", TokenType::KW_DEFAULT},
     {"const", TokenType::KW_CONST},
+    {"sizeof", TokenType::KW_SIZEOF},
 };
 
 Lexer::Lexer(const std::string& source)
@@ -349,6 +357,9 @@ std::vector<Token> Lexer::tokenize() {
                 if (peek() == '=') {
                     advance();
                     tokens.push_back(makeToken(TokenType::LESS_EQUAL, "<="));
+                } else if (peek() == '<') {
+                    advance();
+                    tokens.push_back(makeToken(TokenType::LESS_LESS, "<<"));
                 } else {
                     tokens.push_back(makeToken(TokenType::LESS, "<"));
                 }
@@ -358,6 +369,9 @@ std::vector<Token> Lexer::tokenize() {
                 if (peek() == '=') {
                     advance();
                     tokens.push_back(makeToken(TokenType::GREATER_EQUAL, ">="));
+                } else if (peek() == '>') {
+                    advance();
+                    tokens.push_back(makeToken(TokenType::GREATER_GREATER, ">>"));
                 } else {
                     tokens.push_back(makeToken(TokenType::GREATER, ">"));
                 }
@@ -576,11 +590,15 @@ struct Type {
     int pointerLevel = 0;
     std::string structName;
     std::string funcPointerTypedefName;
+    std::string enumName;
 
     bool isVoid() const { return base == PrimitiveType::VOID && pointerLevel == 0; }
     bool isStruct() const { return !structName.empty(); }
     bool isFunctionPointer() const { return !funcPointerTypedefName.empty(); }
+    bool isEnum() const { return !enumName.empty() && pointerLevel == 0; }
 };
+
+std::string typeToString(const Type& type);
 
 class Expression : public ASTNode {
 public:
@@ -603,9 +621,20 @@ public:
 
     Kind kind;
     std::string value;
+    std::string enumName;
 
-    Literal(Kind kind, const std::string& value)
-        : kind(kind), value(value) {}
+    Literal(Kind kind, const std::string& value, const std::string& enumName = "")
+        : kind(kind), value(value), enumName(enumName) {}
+
+    void accept(ASTVisitor* visitor) override;
+};
+
+class SizeofExpr : public Expression {
+public:
+    Type targetType;
+
+    explicit SizeofExpr(const Type& targetType)
+        : targetType(targetType) {}
 
     void accept(ASTVisitor* visitor) override;
 };
@@ -639,6 +668,8 @@ public:
         BITWISE_AND,
         BITWISE_OR,
         BITWISE_XOR,
+        SHIFT_LEFT,
+        SHIFT_RIGHT,
         ASSIGN,
     };
 
@@ -746,11 +777,13 @@ public:
     std::string name;
     std::unique_ptr<Expression> initializer;
     bool isConst;
+    int arraySize;
 
     VariableDecl(const Type& type, const std::string& name,
                  std::unique_ptr<Expression> initializer = nullptr,
-                 bool isConst = false)
-        : type(type), name(name), initializer(std::move(initializer)), isConst(isConst) {}
+                 bool isConst = false, int arraySize = 0)
+        : type(type), name(name), initializer(std::move(initializer)),
+          isConst(isConst), arraySize(arraySize) {}
 
     void accept(ASTVisitor* visitor) override;
 };
@@ -896,6 +929,16 @@ struct FuncPointerTypedef {
     std::vector<Type> paramTypes;
 };
 
+struct EnumConstant {
+    std::string name;
+    int value;
+};
+
+struct EnumDecl {
+    std::string name;
+    std::vector<EnumConstant> constants;
+};
+
 struct GlobalVariable {
     Type type;
     std::string name;
@@ -914,14 +957,17 @@ public:
     std::vector<std::unique_ptr<FunctionDecl>> functions;
     std::vector<FuncPointerTypedef> funcPointerTypedefs;
     std::vector<GlobalVariable> globalVariables;
+    std::vector<EnumDecl> enums;
 
     Program(std::vector<std::unique_ptr<StructDecl>> structs = {},
             std::vector<std::unique_ptr<FunctionDecl>> functions = {},
             std::vector<FuncPointerTypedef> funcPointerTypedefs = {},
-            std::vector<GlobalVariable> globalVariables = {})
+            std::vector<GlobalVariable> globalVariables = {},
+            std::vector<EnumDecl> enums = {})
         : structs(std::move(structs)), functions(std::move(functions)),
           funcPointerTypedefs(std::move(funcPointerTypedefs)),
-          globalVariables(std::move(globalVariables)) {}
+          globalVariables(std::move(globalVariables)),
+          enums(std::move(enums)) {}
 
     void accept(ASTVisitor* visitor) override;
 };
@@ -931,6 +977,7 @@ public:
     virtual ~ASTVisitor() = default;
 
     virtual void visit(Literal* node) = 0;
+    virtual void visit(SizeofExpr* node) = 0;
     virtual void visit(Identifier* node) = 0;
     virtual void visit(BinaryOp* node) = 0;
     virtual void visit(UnaryOp* node) = 0;
@@ -953,7 +1000,40 @@ public:
     virtual void visit(Program* node) = 0;
 };
 
+std::string typeToString(const Type& type) {
+    std::string name;
+
+    if (type.isFunctionPointer()) {
+        name = type.funcPointerTypedefName;
+    } else if (!type.enumName.empty()) {
+        name = type.enumName;
+    } else if (type.isStruct()) {
+        name = type.structName;
+    } else if (type.base == PrimitiveType::CHAR && type.pointerLevel == 1) {
+        return "string";
+    } else {
+        switch (type.base) {
+            case PrimitiveType::INT:    name = "int"; break;
+            case PrimitiveType::FLOAT:  name = "float"; break;
+            case PrimitiveType::DOUBLE: name = "double"; break;
+            case PrimitiveType::BOOL:   name = "bool"; break;
+            case PrimitiveType::CHAR:   name = "char"; break;
+            case PrimitiveType::VOID:   name = "void"; break;
+            default:                    name = "unknown"; break;
+        }
+    }
+
+    for (int i = 0; i < type.pointerLevel; ++i) {
+        name += "*";
+    }
+    return name;
+}
+
 void Literal::accept(ASTVisitor* visitor) {
+    visitor->visit(this);
+}
+
+void SizeofExpr::accept(ASTVisitor* visitor) {
     visitor->visit(this);
 }
 
@@ -1054,13 +1134,50 @@ public:
     std::unique_ptr<b::ast::Program> parse();
 
 private:
+    struct GenericTemplate {
+        std::string name;
+        std::vector<std::string> typeParams;
+        std::vector<b::lexer::Token> tokens;
+        size_t nameIndex = 0;
+        bool isStruct = false;
+    };
+
+    struct PendingInstantiation {
+        std::string templateName;
+        std::string mangledName;
+        std::vector<b::ast::Type> typeArgs;
+        bool isStruct = false;
+    };
+
     std::vector<b::lexer::Token> tokens;
     size_t current;
     std::unordered_map<std::string, int> enumConstants;
+    std::unordered_map<std::string, std::string> enumConstantOwner;
     std::unordered_set<std::string> enumTypeNames;
+    std::vector<b::ast::EnumDecl> enumDecls;
     std::unordered_set<std::string> funcPointerTypedefNames;
-    std::unordered_set<std::string> visitedFiles;
     std::unordered_set<std::string> constVariables;
+    std::unordered_map<std::string, GenericTemplate> genericStructs;
+    std::unordered_map<std::string, GenericTemplate> genericFunctions;
+    std::vector<PendingInstantiation> pendingInstantiations;
+    std::unordered_set<std::string> requestedInstantiations;
+
+    void prescanDeclarations();
+    size_t scanEnumDeclaration(size_t index);
+    void scanTypedefName(size_t index);
+    bool scanGenericTemplate(size_t declStart, size_t nameIndex, bool isStruct, size_t& outNext);
+    bool isGenericHeader(size_t nameIndex, bool requireCallParen) const;
+
+    std::string mangleTypeName(const b::ast::Type& type) const;
+    std::vector<b::lexer::Token> typeToTokens(const b::ast::Type& type) const;
+    std::vector<b::ast::Type> parseGenericArgList();
+    void consumeGenericClose();
+    std::string requestInstantiation(const std::string& templateName, bool isStruct,
+                                     const std::vector<b::ast::Type>& typeArgs);
+    std::vector<b::lexer::Token> instantiateTemplate(const GenericTemplate& tmpl,
+                                                     const PendingInstantiation& job) const;
+    bool looksLikeDeclarationStart() const;
+    std::string location() const;
 
     b::lexer::Token peek() const;
     b::lexer::Token previous() const;
@@ -1094,6 +1211,7 @@ private:
     std::unique_ptr<b::ast::Expression> parseBitwiseAnd();
     std::unique_ptr<b::ast::Expression> parseEquality();
     std::unique_ptr<b::ast::Expression> parseComparison();
+    std::unique_ptr<b::ast::Expression> parseShift();
     std::unique_ptr<b::ast::Expression> parseAdditive();
     std::unique_ptr<b::ast::Expression> parseMultiplicative();
     std::unique_ptr<b::ast::Expression> parseUnary();
@@ -1113,15 +1231,14 @@ std::unique_ptr<b::ast::Program> Parser::parse() {
     std::vector<b::ast::FuncPointerTypedef> typedefs;
     std::vector<b::ast::GlobalVariable> globals;
 
+    prescanDeclarations();
+
     while (!isAtEnd()) {
         if (check(b::lexer::TokenType::EOF_TOKEN)) break;
         if (check(b::lexer::TokenType::KW_IMPORT)) {
             advance();
-            if (check(b::lexer::TokenType::STRING)) {
-                std::string path = peek().value;
-                advance();
-                consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after import");
-            }
+            consume(b::lexer::TokenType::STRING, "Expected module path after 'import'");
+            consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after import");
         } else if (check(b::lexer::TokenType::KW_STRUCT)) {
             structs.push_back(parseStructDecl());
         } else if (check(b::lexer::TokenType::KW_ENUM)) {
@@ -1131,45 +1248,532 @@ std::unique_ptr<b::ast::Program> Parser::parse() {
         } else if (check(b::lexer::TokenType::KW_CONST)) {
             advance();
             b::ast::Type type = parseType();
-            std::string name = consume(b::lexer::TokenType::IDENTIFIER, "Expected identifier").lexeme;
-            consume(b::lexer::TokenType::EQUAL, "Expected '=' in global const declaration");
+            std::string name = consume(b::lexer::TokenType::IDENTIFIER, "Expected identifier" + location()).lexeme;
+            consume(b::lexer::TokenType::EQUAL, "Expected '=' in global const declaration" + location());
             auto init = parseExpression();
-            consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after global const");
+            consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after global const" + location());
             globals.emplace_back(type, name, std::move(init), true);
             constVariables.insert(name);
-        } else if (check(b::lexer::TokenType::KW_INT) ||
-                   check(b::lexer::TokenType::KW_FLOAT) ||
-                   check(b::lexer::TokenType::KW_DOUBLE) ||
-                   check(b::lexer::TokenType::KW_BOOL) ||
-                   check(b::lexer::TokenType::KW_CHAR) ||
-                   check(b::lexer::TokenType::KW_STRING)) {
+        } else {
             size_t saveTypePos = current;
             b::ast::Type type = parseType();
-            if (check(b::lexer::TokenType::IDENTIFIER)) {
-                std::string name = peek().lexeme;
-                size_t saveNamePos = current;
-                advance();
-                if (check(b::lexer::TokenType::EQUAL) || check(b::lexer::TokenType::SEMICOLON)) {
-                    std::unique_ptr<b::ast::Expression> init = nullptr;
-                    if (check(b::lexer::TokenType::EQUAL)) {
-                        advance();
-                        init = parseExpression();
-                    }
-                    consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after global variable");
-                    globals.emplace_back(type, name, std::move(init), false);
-                } else {
-                    current = saveTypePos;
-                    functions.push_back(parseFunctionDecl());
-                }
-            } else {
-                throw b::CompilerException("Unexpected token in top-level");
+            if (!check(b::lexer::TokenType::IDENTIFIER)) {
+                throw ParseException("Expected name after type in top-level declaration" + location());
             }
-        } else {
-            functions.push_back(parseFunctionDecl());
+            std::string name = advance().lexeme;
+            if (check(b::lexer::TokenType::LPAREN)) {
+                current = saveTypePos;
+                functions.push_back(parseFunctionDecl());
+            } else {
+                if (check(b::lexer::TokenType::LBRACKET)) {
+                    throw ParseException("Fixed-size arrays are only supported for local variables; "
+                                         "allocate global buffers with malloc" + location());
+                }
+                std::unique_ptr<b::ast::Expression> init = nullptr;
+                if (match(b::lexer::TokenType::EQUAL)) {
+                    init = parseExpression();
+                }
+                consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after global variable" + location());
+                globals.emplace_back(type, name, std::move(init), false);
+            }
         }
     }
 
-    return std::make_unique<b::ast::Program>(std::move(structs), std::move(functions), std::move(typedefs), std::move(globals));
+    while (!pendingInstantiations.empty()) {
+        PendingInstantiation job = pendingInstantiations.front();
+        pendingInstantiations.erase(pendingInstantiations.begin());
+
+        const auto& templates = job.isStruct ? genericStructs : genericFunctions;
+        auto it = templates.find(job.templateName);
+        if (it == templates.end()) {
+            throw ParseException("Unknown generic template: " + job.templateName);
+        }
+
+        std::vector<b::lexer::Token> savedTokens = std::move(tokens);
+        size_t savedCurrent = current;
+
+        tokens = instantiateTemplate(it->second, job);
+        tokens.push_back(b::lexer::Token(b::lexer::TokenType::EOF_TOKEN, "", "", 0, 0));
+        current = 0;
+
+        if (job.isStruct) {
+            structs.push_back(parseStructDecl());
+        } else {
+            functions.push_back(parseFunctionDecl());
+        }
+
+        tokens = std::move(savedTokens);
+        current = savedCurrent;
+    }
+
+    return std::make_unique<b::ast::Program>(std::move(structs), std::move(functions),
+                                             std::move(typedefs), std::move(globals),
+                                             std::move(enumDecls));
+}
+
+std::string Parser::location() const {
+    if (current >= tokens.size()) {
+        return "";
+    }
+    const b::lexer::Token& token = tokens[current];
+    std::string where = " (";
+    if (!token.file.empty()) {
+        where += token.file + ":";
+    }
+    where += "line " + std::to_string(token.line) + ")";
+    return where;
+}
+
+void Parser::prescanDeclarations() {
+    std::vector<b::lexer::Token> filtered;
+    size_t i = 0;
+    int depth = 0;
+    size_t declStartInFiltered = 0;
+    size_t declStartInSource = 0;
+
+    while (i < tokens.size()) {
+        const b::lexer::Token& token = tokens[i];
+
+        if (token.type == b::lexer::TokenType::EOF_TOKEN) {
+            filtered.push_back(token);
+            ++i;
+            continue;
+        }
+
+        if (depth == 0 && token.type == b::lexer::TokenType::KW_ENUM) {
+            size_t next = scanEnumDeclaration(i);
+            for (size_t k = i; k < next; ++k) {
+                filtered.push_back(tokens[k]);
+            }
+            i = next;
+            declStartInFiltered = filtered.size();
+            declStartInSource = i;
+            continue;
+        }
+
+        if (depth == 0 && token.type == b::lexer::TokenType::KW_TYPEDEF) {
+            scanTypedefName(i);
+        }
+
+        if (depth == 0 && token.type == b::lexer::TokenType::KW_STRUCT &&
+            i + 2 < tokens.size() &&
+            tokens[i + 1].type == b::lexer::TokenType::IDENTIFIER &&
+            tokens[i + 2].type == b::lexer::TokenType::LESS) {
+            size_t next = 0;
+            if (scanGenericTemplate(i, i + 1, true, next)) {
+                i = next;
+                declStartInFiltered = filtered.size();
+                declStartInSource = i;
+                continue;
+            }
+        }
+
+        if (depth == 0 && token.type == b::lexer::TokenType::IDENTIFIER &&
+            i > declStartInSource && isGenericHeader(i, true)) {
+            size_t next = 0;
+            if (scanGenericTemplate(declStartInSource, i, false, next)) {
+                filtered.resize(declStartInFiltered);
+                i = next;
+                declStartInSource = i;
+                continue;
+            }
+        }
+
+        if (token.type == b::lexer::TokenType::LBRACE) {
+            depth++;
+        } else if (token.type == b::lexer::TokenType::RBRACE) {
+            depth--;
+        }
+
+        filtered.push_back(token);
+        ++i;
+
+        if (depth == 0 &&
+            (token.type == b::lexer::TokenType::SEMICOLON ||
+             token.type == b::lexer::TokenType::RBRACE)) {
+            declStartInFiltered = filtered.size();
+            declStartInSource = i;
+        }
+    }
+
+    tokens = std::move(filtered);
+    current = 0;
+}
+
+size_t Parser::scanEnumDeclaration(size_t index) {
+    size_t i = index + 1;
+    if (i >= tokens.size() || tokens[i].type != b::lexer::TokenType::IDENTIFIER) {
+        throw ParseException("Expected enum name");
+    }
+
+    b::ast::EnumDecl decl;
+    decl.name = tokens[i].lexeme;
+
+    if (enumTypeNames.count(decl.name)) {
+        throw ParseException("Duplicate enum type: " + decl.name);
+    }
+    enumTypeNames.insert(decl.name);
+    ++i;
+
+    if (i >= tokens.size() || tokens[i].type != b::lexer::TokenType::LBRACE) {
+        throw ParseException("Expected '{' after enum name " + decl.name);
+    }
+    ++i;
+
+    int nextValue = 0;
+    while (i < tokens.size() && tokens[i].type != b::lexer::TokenType::RBRACE) {
+        if (tokens[i].type != b::lexer::TokenType::IDENTIFIER) {
+            throw ParseException("Expected enum constant name in enum " + decl.name);
+        }
+        std::string constantName = tokens[i].lexeme;
+        ++i;
+
+        int value = nextValue;
+        if (i < tokens.size() && tokens[i].type == b::lexer::TokenType::EQUAL) {
+            ++i;
+            bool negative = false;
+            if (i < tokens.size() && tokens[i].type == b::lexer::TokenType::MINUS) {
+                negative = true;
+                ++i;
+            }
+            if (i >= tokens.size() || tokens[i].type != b::lexer::TokenType::INTEGER) {
+                throw ParseException("Expected integer after '=' in enum " + decl.name);
+            }
+            value = std::stoi(tokens[i].value);
+            if (negative) {
+                value = -value;
+            }
+            ++i;
+        }
+
+        auto existing = enumConstantOwner.find(constantName);
+        if (existing != enumConstantOwner.end()) {
+            throw ParseException("Enum constant '" + constantName + "' is already defined in enum " +
+                                 existing->second);
+        }
+
+        enumConstants[constantName] = value;
+        enumConstantOwner[constantName] = decl.name;
+        decl.constants.push_back({constantName, value});
+        nextValue = value + 1;
+
+        if (i < tokens.size() && tokens[i].type == b::lexer::TokenType::COMMA) {
+            ++i;
+        } else {
+            break;
+        }
+    }
+
+    if (i >= tokens.size() || tokens[i].type != b::lexer::TokenType::RBRACE) {
+        throw ParseException("Expected '}' after enum " + decl.name);
+    }
+    ++i;
+
+    if (i >= tokens.size() || tokens[i].type != b::lexer::TokenType::SEMICOLON) {
+        throw ParseException("Expected ';' after enum " + decl.name);
+    }
+    ++i;
+
+    enumDecls.push_back(std::move(decl));
+    return i;
+}
+
+void Parser::scanTypedefName(size_t index) {
+    for (size_t i = index; i + 2 < tokens.size(); ++i) {
+        if (tokens[i].type == b::lexer::TokenType::SEMICOLON) {
+            return;
+        }
+        if (tokens[i].type == b::lexer::TokenType::LPAREN &&
+            tokens[i + 1].type == b::lexer::TokenType::STAR &&
+            tokens[i + 2].type == b::lexer::TokenType::IDENTIFIER) {
+            funcPointerTypedefNames.insert(tokens[i + 2].lexeme);
+            return;
+        }
+    }
+}
+
+bool Parser::isGenericHeader(size_t nameIndex, bool requireCallParen) const {
+    size_t i = nameIndex + 1;
+    if (i >= tokens.size() || tokens[i].type != b::lexer::TokenType::LESS) {
+        return false;
+    }
+    ++i;
+
+    bool expectName = true;
+    while (i < tokens.size()) {
+        if (expectName) {
+            if (tokens[i].type != b::lexer::TokenType::IDENTIFIER) {
+                return false;
+            }
+            expectName = false;
+        } else if (tokens[i].type == b::lexer::TokenType::COMMA) {
+            expectName = true;
+        } else if (tokens[i].type == b::lexer::TokenType::GREATER) {
+            if (!requireCallParen) {
+                return true;
+            }
+            return i + 1 < tokens.size() && tokens[i + 1].type == b::lexer::TokenType::LPAREN;
+        } else {
+            return false;
+        }
+        ++i;
+    }
+    return false;
+}
+
+bool Parser::scanGenericTemplate(size_t declStart, size_t nameIndex, bool isStruct, size_t& outNext) {
+    if (!isGenericHeader(nameIndex, false)) {
+        return false;
+    }
+
+    GenericTemplate tmpl;
+    tmpl.name = tokens[nameIndex].lexeme;
+    tmpl.isStruct = isStruct;
+    tmpl.nameIndex = nameIndex - declStart;
+
+    size_t i = nameIndex + 2;
+    while (i < tokens.size() && tokens[i].type != b::lexer::TokenType::GREATER) {
+        if (tokens[i].type == b::lexer::TokenType::IDENTIFIER) {
+            tmpl.typeParams.push_back(tokens[i].lexeme);
+        }
+        ++i;
+    }
+    if (i >= tokens.size()) {
+        return false;
+    }
+    size_t afterParams = i + 1;
+
+    if (tmpl.typeParams.empty()) {
+        throw ParseException("Generic declaration '" + tmpl.name + "' needs at least one type parameter");
+    }
+
+    size_t end = 0;
+    if (isStruct) {
+        if (afterParams >= tokens.size() || tokens[afterParams].type != b::lexer::TokenType::LBRACE) {
+            return false;
+        }
+        int depth = 0;
+        size_t k = afterParams;
+        for (; k < tokens.size(); ++k) {
+            if (tokens[k].type == b::lexer::TokenType::LBRACE) depth++;
+            else if (tokens[k].type == b::lexer::TokenType::RBRACE) {
+                depth--;
+                if (depth == 0) break;
+            }
+        }
+        if (k >= tokens.size()) {
+            throw ParseException("Unterminated generic struct " + tmpl.name);
+        }
+        if (k + 1 >= tokens.size() || tokens[k + 1].type != b::lexer::TokenType::SEMICOLON) {
+            throw ParseException("Expected ';' after generic struct " + tmpl.name);
+        }
+        end = k + 1;
+    } else {
+        if (afterParams >= tokens.size() || tokens[afterParams].type != b::lexer::TokenType::LPAREN) {
+            return false;
+        }
+        int depth = 0;
+        size_t k = afterParams;
+        for (; k < tokens.size(); ++k) {
+            if (tokens[k].type == b::lexer::TokenType::LPAREN) depth++;
+            else if (tokens[k].type == b::lexer::TokenType::RPAREN) {
+                depth--;
+                if (depth == 0) break;
+            }
+        }
+        if (k >= tokens.size() || k + 1 >= tokens.size() ||
+            tokens[k + 1].type != b::lexer::TokenType::LBRACE) {
+            throw ParseException("Expected function body for generic function " + tmpl.name);
+        }
+        depth = 0;
+        size_t b = k + 1;
+        for (; b < tokens.size(); ++b) {
+            if (tokens[b].type == b::lexer::TokenType::LBRACE) depth++;
+            else if (tokens[b].type == b::lexer::TokenType::RBRACE) {
+                depth--;
+                if (depth == 0) break;
+            }
+        }
+        if (b >= tokens.size()) {
+            throw ParseException("Unterminated generic function " + tmpl.name);
+        }
+        end = b;
+    }
+
+    for (size_t k = declStart; k <= nameIndex; ++k) {
+        tmpl.tokens.push_back(tokens[k]);
+    }
+    for (size_t k = afterParams; k <= end; ++k) {
+        tmpl.tokens.push_back(tokens[k]);
+    }
+
+    auto& target = isStruct ? genericStructs : genericFunctions;
+    if (target.count(tmpl.name)) {
+        throw ParseException("Duplicate generic declaration: " + tmpl.name);
+    }
+    target[tmpl.name] = std::move(tmpl);
+
+    outNext = end + 1;
+    return true;
+}
+
+std::string Parser::mangleTypeName(const b::ast::Type& type) const {
+    std::string name;
+
+    if (type.isFunctionPointer()) {
+        name = type.funcPointerTypedefName;
+    } else if (!type.enumName.empty()) {
+        name = type.enumName;
+    } else if (type.isStruct()) {
+        name = type.structName;
+    } else {
+        switch (type.base) {
+            case b::ast::PrimitiveType::INT:    name = "int"; break;
+            case b::ast::PrimitiveType::FLOAT:  name = "float"; break;
+            case b::ast::PrimitiveType::DOUBLE: name = "double"; break;
+            case b::ast::PrimitiveType::BOOL:   name = "bool"; break;
+            case b::ast::PrimitiveType::CHAR:   name = "char"; break;
+            case b::ast::PrimitiveType::VOID:   name = "void"; break;
+            default:                            name = "unknown"; break;
+        }
+    }
+
+    for (int i = 0; i < type.pointerLevel; ++i) {
+        name += "_ptr";
+    }
+    return name;
+}
+
+std::vector<b::lexer::Token> Parser::typeToTokens(const b::ast::Type& type) const {
+    std::vector<b::lexer::Token> result;
+    b::lexer::TokenType baseType = b::lexer::TokenType::IDENTIFIER;
+    std::string lexeme;
+
+    if (type.isFunctionPointer()) {
+        lexeme = type.funcPointerTypedefName;
+    } else if (!type.enumName.empty()) {
+        lexeme = type.enumName;
+    } else if (type.isStruct()) {
+        lexeme = type.structName;
+    } else {
+        switch (type.base) {
+            case b::ast::PrimitiveType::INT:
+                baseType = b::lexer::TokenType::KW_INT; lexeme = "int"; break;
+            case b::ast::PrimitiveType::FLOAT:
+                baseType = b::lexer::TokenType::KW_FLOAT; lexeme = "float"; break;
+            case b::ast::PrimitiveType::DOUBLE:
+                baseType = b::lexer::TokenType::KW_DOUBLE; lexeme = "double"; break;
+            case b::ast::PrimitiveType::BOOL:
+                baseType = b::lexer::TokenType::KW_BOOL; lexeme = "bool"; break;
+            case b::ast::PrimitiveType::CHAR:
+                baseType = b::lexer::TokenType::KW_CHAR; lexeme = "char"; break;
+            case b::ast::PrimitiveType::VOID:
+                baseType = b::lexer::TokenType::KW_VOID; lexeme = "void"; break;
+            default:
+                throw ParseException("Cannot use this type as a generic argument");
+        }
+    }
+
+    result.push_back(b::lexer::Token(baseType, lexeme, lexeme, 0, 0));
+    for (int i = 0; i < type.pointerLevel; ++i) {
+        result.push_back(b::lexer::Token(b::lexer::TokenType::STAR, "*", "*", 0, 0));
+    }
+    return result;
+}
+
+void Parser::consumeGenericClose() {
+    if (check(b::lexer::TokenType::GREATER)) {
+        advance();
+        return;
+    }
+    if (check(b::lexer::TokenType::GREATER_GREATER)) {
+        tokens[current] = b::lexer::Token(b::lexer::TokenType::GREATER, ">", ">",
+                                          tokens[current].line, tokens[current].column + 1);
+        return;
+    }
+    throw ParseException("Expected '>' after generic type arguments" + location());
+}
+
+std::vector<b::ast::Type> Parser::parseGenericArgList() {
+    consume(b::lexer::TokenType::LESS, "Expected '<' before generic type arguments" + location());
+
+    std::vector<b::ast::Type> args;
+    do {
+        args.push_back(parseType());
+    } while (match(b::lexer::TokenType::COMMA));
+
+    consumeGenericClose();
+    return args;
+}
+
+std::string Parser::requestInstantiation(const std::string& templateName, bool isStruct,
+                                         const std::vector<b::ast::Type>& typeArgs) {
+    const auto& templates = isStruct ? genericStructs : genericFunctions;
+    auto it = templates.find(templateName);
+    if (it == templates.end()) {
+        throw ParseException("Unknown generic: " + templateName);
+    }
+
+    if (it->second.typeParams.size() != typeArgs.size()) {
+        throw ParseException(templateName + " expects " +
+                             std::to_string(it->second.typeParams.size()) +
+                             " type argument(s), got " + std::to_string(typeArgs.size()) + location());
+    }
+
+    std::string mangled = templateName;
+    for (const auto& arg : typeArgs) {
+        mangled += "__" + mangleTypeName(arg);
+    }
+
+    if (!requestedInstantiations.count(mangled)) {
+        requestedInstantiations.insert(mangled);
+        PendingInstantiation job;
+        job.templateName = templateName;
+        job.mangledName = mangled;
+        job.typeArgs = typeArgs;
+        job.isStruct = isStruct;
+        pendingInstantiations.push_back(std::move(job));
+    }
+
+    return mangled;
+}
+
+std::vector<b::lexer::Token> Parser::instantiateTemplate(const GenericTemplate& tmpl,
+                                                         const PendingInstantiation& job) const {
+    std::unordered_map<std::string, std::vector<b::lexer::Token>> substitutions;
+    for (size_t i = 0; i < tmpl.typeParams.size(); ++i) {
+        substitutions[tmpl.typeParams[i]] = typeToTokens(job.typeArgs[i]);
+    }
+
+    std::vector<b::lexer::Token> result;
+    for (size_t i = 0; i < tmpl.tokens.size(); ++i) {
+        const b::lexer::Token& token = tmpl.tokens[i];
+
+        if (i == tmpl.nameIndex) {
+            b::lexer::Token renamed = token;
+            renamed.lexeme = job.mangledName;
+            renamed.value = job.mangledName;
+            result.push_back(renamed);
+            continue;
+        }
+
+        if (token.type == b::lexer::TokenType::IDENTIFIER) {
+            auto it = substitutions.find(token.lexeme);
+            if (it != substitutions.end()) {
+                for (b::lexer::Token replacement : it->second) {
+                    replacement.line = token.line;
+                    replacement.column = token.column;
+                    replacement.file = token.file;
+                    result.push_back(replacement);
+                }
+                continue;
+            }
+        }
+
+        result.push_back(token);
+    }
+
+    return result;
 }
 
 b::lexer::Token Parser::peek() const {
@@ -1237,18 +1841,30 @@ b::ast::Type Parser::parseType() {
     } else if (match(b::lexer::TokenType::KW_VOID)) {
         type.base = b::ast::PrimitiveType::VOID;
     } else if (check(b::lexer::TokenType::IDENTIFIER) &&
+               genericStructs.count(peek().lexeme) > 0 &&
+               current + 1 < tokens.size() &&
+               tokens[current + 1].type == b::lexer::TokenType::LESS) {
+        std::string templateName = advance().lexeme;
+        std::vector<b::ast::Type> typeArgs = parseGenericArgList();
+        type.structName = requestInstantiation(templateName, true, typeArgs);
+        type.base = b::ast::PrimitiveType::INT;
+    } else if (check(b::lexer::TokenType::IDENTIFIER) &&
                enumTypeNames.count(peek().lexeme) > 0) {
-        advance();
+        type.enumName = advance().lexeme;
         type.base = b::ast::PrimitiveType::INT;
     } else if (check(b::lexer::TokenType::IDENTIFIER) &&
                funcPointerTypedefNames.count(peek().lexeme) > 0) {
         type.funcPointerTypedefName = advance().lexeme;
         type.base = b::ast::PrimitiveType::INT;
     } else if (check(b::lexer::TokenType::IDENTIFIER)) {
+        if (genericStructs.count(peek().lexeme) > 0) {
+            throw ParseException("Generic struct '" + peek().lexeme +
+                                 "' needs type arguments, for example " + peek().lexeme + "<int>" + location());
+        }
         type.structName = advance().lexeme;
         type.base = b::ast::PrimitiveType::INT;
     } else {
-        throw ParseException("Expected type, got " + peek().lexeme);
+        throw ParseException("Expected type, got '" + peek().lexeme + "'" + location());
     }
 
     while (match(b::lexer::TokenType::STAR)) {
@@ -1293,27 +1909,11 @@ std::unique_ptr<b::ast::StructDecl> Parser::parseStructDecl() {
 
 void Parser::parseEnumDecl() {
     consume(b::lexer::TokenType::KW_ENUM, "Expected 'enum'");
-    std::string enumName = consume(b::lexer::TokenType::IDENTIFIER, "Expected enum name").lexeme;
+    consume(b::lexer::TokenType::IDENTIFIER, "Expected enum name");
     consume(b::lexer::TokenType::LBRACE, "Expected '{' after enum name");
 
-    enumTypeNames.insert(enumName);
-    int nextValue = 0;
-
     while (!check(b::lexer::TokenType::RBRACE) && !isAtEnd()) {
-        std::string valueName = consume(b::lexer::TokenType::IDENTIFIER, "Expected enum value name").lexeme;
-
-        int value = nextValue;
-        if (match(b::lexer::TokenType::EQUAL)) {
-            b::lexer::Token numberToken = consume(b::lexer::TokenType::INTEGER, "Expected integer after '=' in enum");
-            value = std::stoi(numberToken.value);
-        }
-
-        enumConstants[valueName] = value;
-        nextValue = value + 1;
-
-        if (!match(b::lexer::TokenType::COMMA)) {
-            break;
-        }
+        advance();
     }
 
     consume(b::lexer::TokenType::RBRACE, "Expected '}' after enum body");
@@ -1367,6 +1967,41 @@ std::unique_ptr<b::ast::FunctionDecl> Parser::parseFunctionDecl() {
     );
 }
 
+bool Parser::looksLikeDeclarationStart() const {
+    if (check(b::lexer::TokenType::KW_INT) ||
+        check(b::lexer::TokenType::KW_FLOAT) ||
+        check(b::lexer::TokenType::KW_DOUBLE) ||
+        check(b::lexer::TokenType::KW_BOOL) ||
+        check(b::lexer::TokenType::KW_CHAR) ||
+        check(b::lexer::TokenType::KW_STRING) ||
+        check(b::lexer::TokenType::KW_VOID)) {
+        return true;
+    }
+
+    if (!check(b::lexer::TokenType::IDENTIFIER)) {
+        return false;
+    }
+
+    if (enumConstants.count(peek().lexeme) > 0) {
+        return false;
+    }
+
+    if (genericStructs.count(peek().lexeme) > 0 &&
+        current + 1 < tokens.size() &&
+        tokens[current + 1].type == b::lexer::TokenType::LESS) {
+        return true;
+    }
+
+    size_t lookAhead = current + 1;
+    while (lookAhead < tokens.size() &&
+           (tokens[lookAhead].type == b::lexer::TokenType::STAR ||
+            tokens[lookAhead].type == b::lexer::TokenType::AMPERSAND)) {
+        lookAhead++;
+    }
+    return lookAhead < tokens.size() &&
+           tokens[lookAhead].type == b::lexer::TokenType::IDENTIFIER;
+}
+
 std::unique_ptr<b::ast::Statement> Parser::parseStatement() {
     if (match(b::lexer::TokenType::LBRACE)) {
         auto block = parseBlock();
@@ -1392,17 +2027,8 @@ std::unique_ptr<b::ast::Statement> Parser::parseStatement() {
         constVariables.insert(name);
         return std::make_unique<b::ast::VariableDecl>(type, name, std::move(init), true);
     }
-    if (check(b::lexer::TokenType::IDENTIFIER)) {
-        size_t lookAhead = current + 1;
-        while (lookAhead < tokens.size() &&
-               (tokens[lookAhead].type == b::lexer::TokenType::STAR ||
-                tokens[lookAhead].type == b::lexer::TokenType::AMPERSAND)) {
-            lookAhead++;
-        }
-        if (lookAhead < tokens.size() &&
-            tokens[lookAhead].type == b::lexer::TokenType::IDENTIFIER) {
-            return parseVariableDecl();
-        }
+    if (check(b::lexer::TokenType::IDENTIFIER) && looksLikeDeclarationStart()) {
+        return parseVariableDecl();
     }
     if (match(b::lexer::TokenType::KW_IF)) {
         return parseIfStmt();
@@ -1443,15 +2069,30 @@ std::unique_ptr<b::ast::Statement> Parser::parseBlock() {
 
 std::unique_ptr<b::ast::Statement> Parser::parseVariableDecl() {
     b::ast::Type type = parseType();
-    std::string name = consume(b::lexer::TokenType::IDENTIFIER, "Expected variable name").lexeme;
+    std::string name = consume(b::lexer::TokenType::IDENTIFIER, "Expected variable name" + location()).lexeme;
+
+    int arraySize = 0;
+    if (match(b::lexer::TokenType::LBRACKET)) {
+        b::lexer::Token sizeToken = consume(b::lexer::TokenType::INTEGER,
+                                            "Expected a constant size in array declaration" + location());
+        arraySize = std::stoi(sizeToken.value);
+        if (arraySize <= 0) {
+            throw ParseException("Array size must be greater than zero" + location());
+        }
+        consume(b::lexer::TokenType::RBRACKET, "Expected ']' after array size" + location());
+        type.pointerLevel++;
+    }
 
     std::unique_ptr<b::ast::Expression> initializer = nullptr;
     if (match(b::lexer::TokenType::EQUAL)) {
+        if (arraySize > 0) {
+            throw ParseException("Fixed-size arrays cannot have an initializer" + location());
+        }
         initializer = parseExpression();
     }
 
-    consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after variable declaration");
-    return std::make_unique<b::ast::VariableDecl>(type, name, std::move(initializer));
+    consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after variable declaration" + location());
+    return std::make_unique<b::ast::VariableDecl>(type, name, std::move(initializer), false, arraySize);
 }
 
 std::unique_ptr<b::ast::Statement> Parser::parseIfStmt() {
@@ -1477,12 +2118,7 @@ std::unique_ptr<b::ast::Statement> Parser::parseForStmt() {
     std::unique_ptr<b::ast::Statement> init = nullptr;
     if (match(b::lexer::TokenType::SEMICOLON)) {
         init = nullptr;
-    } else if (check(b::lexer::TokenType::KW_INT) ||
-               check(b::lexer::TokenType::KW_FLOAT) ||
-               check(b::lexer::TokenType::KW_DOUBLE) ||
-               check(b::lexer::TokenType::KW_BOOL) ||
-               check(b::lexer::TokenType::KW_CHAR) ||
-               check(b::lexer::TokenType::KW_STRING)) {
+    } else if (looksLikeDeclarationStart()) {
         init = parseVariableDecl();
     } else {
         init = parseExpressionStmt();
@@ -1696,33 +2332,59 @@ std::unique_ptr<b::ast::Expression> Parser::parseEquality() {
     return expr;
 }
 
-std::unique_ptr<b::ast::Expression> Parser::parseComparison() {
+std::unique_ptr<b::ast::Expression> Parser::parseShift() {
     auto expr = parseAdditive();
 
     while (true) {
-        if (match(b::lexer::TokenType::LESS)) {
+        if (match(b::lexer::TokenType::LESS_LESS)) {
             auto right = parseAdditive();
+            expr = std::make_unique<b::ast::BinaryOp>(
+                b::ast::BinaryOp::Operator::SHIFT_LEFT,
+                std::move(expr),
+                std::move(right)
+            );
+        } else if (match(b::lexer::TokenType::GREATER_GREATER)) {
+            auto right = parseAdditive();
+            expr = std::make_unique<b::ast::BinaryOp>(
+                b::ast::BinaryOp::Operator::SHIFT_RIGHT,
+                std::move(expr),
+                std::move(right)
+            );
+        } else {
+            break;
+        }
+    }
+
+    return expr;
+}
+
+std::unique_ptr<b::ast::Expression> Parser::parseComparison() {
+    auto expr = parseShift();
+
+    while (true) {
+        if (match(b::lexer::TokenType::LESS)) {
+            auto right = parseShift();
             expr = std::make_unique<b::ast::BinaryOp>(
                 b::ast::BinaryOp::Operator::LESS,
                 std::move(expr),
                 std::move(right)
             );
         } else if (match(b::lexer::TokenType::LESS_EQUAL)) {
-            auto right = parseAdditive();
+            auto right = parseShift();
             expr = std::make_unique<b::ast::BinaryOp>(
                 b::ast::BinaryOp::Operator::LESS_EQUAL,
                 std::move(expr),
                 std::move(right)
             );
         } else if (match(b::lexer::TokenType::GREATER)) {
-            auto right = parseAdditive();
+            auto right = parseShift();
             expr = std::make_unique<b::ast::BinaryOp>(
                 b::ast::BinaryOp::Operator::GREATER,
                 std::move(expr),
                 std::move(right)
             );
         } else if (match(b::lexer::TokenType::GREATER_EQUAL)) {
-            auto right = parseAdditive();
+            auto right = parseShift();
             expr = std::make_unique<b::ast::BinaryOp>(
                 b::ast::BinaryOp::Operator::GREATER_EQUAL,
                 std::move(expr),
@@ -1796,6 +2458,13 @@ std::unique_ptr<b::ast::Expression> Parser::parseMultiplicative() {
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parseUnary() {
+    if (match(b::lexer::TokenType::KW_SIZEOF)) {
+        consume(b::lexer::TokenType::LPAREN, "Expected '(' after 'sizeof'" + location());
+        b::ast::Type type = parseType();
+        consume(b::lexer::TokenType::RPAREN, "Expected ')' after sizeof type" + location());
+        return std::make_unique<b::ast::SizeofExpr>(type);
+    }
+
     if (check(b::lexer::TokenType::LPAREN)) {
         size_t checkpoint = current;
         advance();
@@ -1807,7 +2476,10 @@ std::unique_ptr<b::ast::Expression> Parser::parseUnary() {
             check(b::lexer::TokenType::KW_BOOL) ||
             check(b::lexer::TokenType::KW_CHAR) ||
             check(b::lexer::TokenType::KW_STRING) ||
-            check(b::lexer::TokenType::KW_VOID);
+            check(b::lexer::TokenType::KW_VOID) ||
+            (check(b::lexer::TokenType::IDENTIFIER) &&
+             (enumTypeNames.count(peek().lexeme) > 0 ||
+              funcPointerTypedefNames.count(peek().lexeme) > 0));
 
         if (looksLikeType) {
             b::ast::Type castType = parseType();
@@ -1933,14 +2605,31 @@ std::unique_ptr<b::ast::Expression> Parser::parsePrimary() {
         );
     }
 
+    if (check(b::lexer::TokenType::IDENTIFIER) &&
+        genericFunctions.count(peek().lexeme) > 0 &&
+        current + 1 < tokens.size() &&
+        tokens[current + 1].type == b::lexer::TokenType::LESS) {
+        std::string templateName = advance().lexeme;
+        std::vector<b::ast::Type> typeArgs = parseGenericArgList();
+        return std::make_unique<b::ast::Identifier>(
+            requestInstantiation(templateName, false, typeArgs)
+        );
+    }
+
     if (check(b::lexer::TokenType::IDENTIFIER)) {
         auto enumIt = enumConstants.find(peek().lexeme);
         if (enumIt != enumConstants.end()) {
+            std::string owner = enumConstantOwner[peek().lexeme];
             advance();
             return std::make_unique<b::ast::Literal>(
-                b::ast::Literal::Kind::INTEGER, std::to_string(enumIt->second)
+                b::ast::Literal::Kind::INTEGER, std::to_string(enumIt->second), owner
             );
         }
+    }
+
+    if (check(b::lexer::TokenType::IDENTIFIER) && genericFunctions.count(peek().lexeme) > 0) {
+        throw ParseException("Generic function '" + peek().lexeme +
+                             "' needs type arguments, for example " + peek().lexeme + "<int>(...)" + location());
     }
 
     if (match(b::lexer::TokenType::IDENTIFIER)) {
@@ -1983,13 +2672,25 @@ private:
     std::stack<std::unordered_map<std::string, b::ast::Type>> arcTypeStack;
     std::unordered_map<std::string, llvm::StructType*> structTypes;
     std::unordered_map<std::string, std::vector<std::string>> structFields;
+    std::unordered_map<std::string, std::unordered_map<std::string, b::ast::Type>> structFieldTypes;
     std::unordered_map<std::string, llvm::FunctionType*> funcPointerTypedefs;
     std::unordered_set<std::string> constVariables;
     std::unordered_map<std::string, llvm::GlobalVariable*> globalVariables;
+    std::unordered_map<std::string, b::ast::Type> globalVariableTypes;
+    std::unordered_map<std::string, b::ast::Type> functionReturnTypes;
+    std::unordered_map<std::string, std::vector<b::ast::Type>> functionParamTypes;
+    std::unordered_map<std::string, std::vector<b::ast::EnumConstant>> enumMembers;
+    std::unordered_set<std::string> definedFunctions;
+    b::ast::Type currentReturnType;
     llvm::Function* currentFunction;
     llvm::Value* lastValue;
     std::vector<llvm::BasicBlock*> breakTargets;
     std::vector<llvm::BasicBlock*> continueTargets;
+
+    std::string enumTypeOf(b::ast::Expression* expr);
+    void checkEnumCompatible(const b::ast::Type& target, b::ast::Expression* value,
+                             const std::string& context);
+    void checkEnumOperands(b::ast::BinaryOp* node);
 
     llvm::Type* arcTypeToLLVM(const b::ast::Type& type);
     b::ast::Type derefType(const b::ast::Type& type);
@@ -1999,11 +2700,14 @@ private:
     void popScope();
     void setVariable(const std::string& name, llvm::Value* value);
     llvm::Value* getVariable(const std::string& name);
-    llvm::Value* getMemberFieldPtr(b::ast::MemberAccess* node, llvm::Type** outFieldType);
+    bool inferType(b::ast::Expression* expr, b::ast::Type& outType);
+    llvm::Value* addressOf(b::ast::Expression* expr, b::ast::Type* outType);
+    llvm::Value* coerceValue(llvm::Value* value, llvm::Type* targetType);
     bool blockIsTerminated();
     llvm::Value* toBoolCondition(llvm::Value* value);
 
     void visit(b::ast::Literal* node) override;
+    void visit(b::ast::SizeofExpr* node) override;
     void visit(b::ast::Identifier* node) override;
     void visit(b::ast::BinaryOp* node) override;
     void visit(b::ast::UnaryOp* node) override;
@@ -2062,6 +2766,9 @@ bool CodeGenerator::generate(b::ast::Program* program, const std::string& output
         }
 
         return emitObject(outputPath);
+    } catch (const b::CompilerException& ex) {
+        llvm::errs() << "Error: " << ex.what() << "\n";
+        return false;
     } catch (const std::exception& ex) {
         llvm::errs() << "Codegen Error: " << ex.what() << "\n";
         return false;
@@ -2284,6 +2991,29 @@ void CodeGenerator::declareBuiltins() {
         llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
                               "sprintf", module.get());
     }
+
+    {
+        std::vector<llvm::Type*> args = {i8Ptr, i8Ptr};
+        auto funcType = llvm::FunctionType::get(i32, args, true);
+        llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
+                              "fprintf", module.get());
+    }
+
+    {
+        std::vector<llvm::Type*> args = {i8Ptr, i64, i64, i8Ptr};
+        auto funcType = llvm::FunctionType::get(i64, args, false);
+        llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
+                              "fwrite", module.get());
+    }
+
+    {
+        std::vector<llvm::Type*> args = {i8Ptr, i32, i8Ptr};
+        auto funcType = llvm::FunctionType::get(i8Ptr, args, false);
+        llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
+                              "fgets", module.get());
+    }
+
+    structTypes["FILE"] = llvm::StructType::create(*context, "FILE");
 }
 
 bool CodeGenerator::blockIsTerminated() {
@@ -2331,10 +3061,139 @@ void CodeGenerator::setVariable(const std::string& name, llvm::Value* value) {
 
 llvm::Value* CodeGenerator::getVariable(const std::string& name) {
     auto it = variables.find(name);
-    if (it == variables.end()) {
-        throw std::runtime_error("Undefined variable: " + name);
+    if (it != variables.end()) {
+        return it->second;
     }
-    return it->second;
+
+    auto globalIt = globalVariables.find(name);
+    if (globalIt != globalVariables.end()) {
+        return globalIt->second;
+    }
+
+    throw std::runtime_error("Undefined variable: " + name);
+}
+
+std::string CodeGenerator::enumTypeOf(b::ast::Expression* expr) {
+    if (auto* literal = dynamic_cast<b::ast::Literal*>(expr)) {
+        return literal->enumName;
+    }
+
+    if (auto* ident = dynamic_cast<b::ast::Identifier*>(expr)) {
+        auto it = arcVariableTypes.find(ident->name);
+        if (it != arcVariableTypes.end() && it->second.isEnum()) {
+            return it->second.enumName;
+        }
+        return "";
+    }
+
+    if (auto* cast = dynamic_cast<b::ast::CastExpr*>(expr)) {
+        return cast->targetType.isEnum() ? cast->targetType.enumName : "";
+    }
+
+    if (auto* call = dynamic_cast<b::ast::FunctionCall*>(expr)) {
+        auto it = functionReturnTypes.find(call->functionName);
+        if (it != functionReturnTypes.end() && it->second.isEnum()) {
+            return it->second.enumName;
+        }
+        return "";
+    }
+
+    if (auto* member = dynamic_cast<b::ast::MemberAccess*>(expr)) {
+        auto* object = dynamic_cast<b::ast::Identifier*>(member->object.get());
+        if (!object) {
+            return "";
+        }
+        auto objectIt = arcVariableTypes.find(object->name);
+        if (objectIt == arcVariableTypes.end()) {
+            return "";
+        }
+        std::string structName = objectIt->second.structName;
+        if (structName.empty()) {
+            return "";
+        }
+        auto structIt = structFieldTypes.find(structName);
+        if (structIt == structFieldTypes.end()) {
+            return "";
+        }
+        auto fieldIt = structIt->second.find(member->member);
+        if (fieldIt == structIt->second.end() || !fieldIt->second.isEnum()) {
+            return "";
+        }
+        return fieldIt->second.enumName;
+    }
+
+    if (auto* binary = dynamic_cast<b::ast::BinaryOp*>(expr)) {
+        if (binary->op == b::ast::BinaryOp::Operator::ASSIGN) {
+            return enumTypeOf(binary->left.get());
+        }
+    }
+
+    return "";
+}
+
+void CodeGenerator::checkEnumCompatible(const b::ast::Type& target, b::ast::Expression* value,
+                                        const std::string& context) {
+    std::string sourceEnum = enumTypeOf(value);
+
+    if (target.isEnum()) {
+        if (sourceEnum.empty()) {
+            throw b::CompilerException("Cannot use a non-enum value for " + context +
+                                       " of enum type '" + target.enumName +
+                                       "'; cast explicitly with (" + target.enumName + ")");
+        }
+        if (sourceEnum != target.enumName) {
+            throw b::CompilerException("Cannot use enum '" + sourceEnum + "' for " + context +
+                                       " of enum type '" + target.enumName + "'");
+        }
+        return;
+    }
+
+    if (!sourceEnum.empty()) {
+        throw b::CompilerException("Cannot use enum '" + sourceEnum + "' for " + context +
+                                   " of type '" + b::ast::typeToString(target) +
+                                   "'; cast explicitly with (int)");
+    }
+}
+
+void CodeGenerator::checkEnumOperands(b::ast::BinaryOp* node) {
+    std::string leftEnum = enumTypeOf(node->left.get());
+    std::string rightEnum = enumTypeOf(node->right.get());
+
+    if (leftEnum.empty() && rightEnum.empty()) {
+        return;
+    }
+
+    bool isEquality = node->op == b::ast::BinaryOp::Operator::EQUAL ||
+                      node->op == b::ast::BinaryOp::Operator::NOT_EQUAL;
+
+    if (!isEquality) {
+        throw b::CompilerException("Enum type '" + (leftEnum.empty() ? rightEnum : leftEnum) +
+                                   "' supports only == and !=; cast to (int) for other operations");
+    }
+
+    if (leftEnum.empty() || rightEnum.empty()) {
+        throw b::CompilerException("Cannot compare enum '" + (leftEnum.empty() ? rightEnum : leftEnum) +
+                                   "' with a non-enum value");
+    }
+
+    if (leftEnum != rightEnum) {
+        throw b::CompilerException("Cannot compare enum '" + leftEnum + "' with enum '" + rightEnum + "'");
+    }
+}
+
+void CodeGenerator::visit(b::ast::SizeofExpr* node) {
+    llvm::Type* type = arcTypeToLLVM(node->targetType);
+    if (node->targetType.isVoid()) {
+        throw b::CompilerException("sizeof(void) is not allowed");
+    }
+    if (!type->isSized()) {
+        throw b::CompilerException("Cannot take sizeof an incomplete type: " +
+                                   b::ast::typeToString(node->targetType));
+    }
+
+    uint64_t size = module->getDataLayout().getTypeAllocSize(type);
+    lastValue = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context),
+                                       static_cast<uint32_t>(size));
 }
 
 void CodeGenerator::visit(b::ast::Literal* node) {
@@ -2393,6 +3252,21 @@ void CodeGenerator::visit(b::ast::Identifier* node) {
 
 void CodeGenerator::visit(b::ast::BinaryOp* node) {
     if (node->op == b::ast::BinaryOp::Operator::ASSIGN) {
+        std::string targetEnum = enumTypeOf(node->left.get());
+        std::string sourceEnum = enumTypeOf(node->right.get());
+        if (targetEnum != sourceEnum) {
+            if (targetEnum.empty()) {
+                throw b::CompilerException("Cannot assign enum '" + sourceEnum +
+                                           "' to a non-enum target; cast explicitly with (int)");
+            }
+            if (sourceEnum.empty()) {
+                throw b::CompilerException("Cannot assign a non-enum value to enum type '" + targetEnum +
+                                           "'; cast explicitly with (" + targetEnum + ")");
+            }
+            throw b::CompilerException("Cannot assign enum '" + sourceEnum + "' to enum '" +
+                                       targetEnum + "'");
+        }
+
         node->right->accept(this);
         llvm::Value* rhsValue = lastValue;
 
@@ -2400,53 +3274,18 @@ void CodeGenerator::visit(b::ast::BinaryOp* node) {
             if (constVariables.count(ident->name)) {
                 throw b::CompilerException("Cannot assign to const variable: " + ident->name);
             }
-            auto globalIt = globalVariables.find(ident->name);
-            if (globalIt != globalVariables.end()) {
-                builder->CreateStore(rhsValue, globalIt->second);
-                lastValue = rhsValue;
-            } else {
-                llvm::Value* lhsAddr = getVariable(ident->name);
-                builder->CreateStore(rhsValue, lhsAddr);
-                lastValue = rhsValue;
-            }
-        } else if (auto* arrayAccess = dynamic_cast<b::ast::ArrayAccess*>(node->left.get())) {
-            arrayAccess->array->accept(this);
-            llvm::Value* arrayPtr = lastValue;
-
-            arrayAccess->index->accept(this);
-            llvm::Value* indexVal = lastValue;
-
-            auto arcTypeIt = arcVariableTypes.find(
-                dynamic_cast<b::ast::Identifier*>(arrayAccess->array.get()) ?
-                dynamic_cast<b::ast::Identifier*>(arrayAccess->array.get())->name : ""
-            );
-
-            if (arcTypeIt != arcVariableTypes.end()) {
-                b::ast::Type elemType = derefType(arcTypeIt->second);
-                llvm::Type* elemLLVMType = arcTypeToLLVM(elemType);
-                llvm::Value* elemPtr = builder->CreateGEP(elemLLVMType, arrayPtr, indexVal);
-                builder->CreateStore(rhsValue, elemPtr);
-                lastValue = rhsValue;
-            } else {
-                throw std::runtime_error("Cannot determine array element type");
-            }
-        } else if (auto* memberAccess = dynamic_cast<b::ast::MemberAccess*>(node->left.get())) {
-            llvm::Type* fieldType = nullptr;
-            llvm::Value* elementPtr = getMemberFieldPtr(memberAccess, &fieldType);
-
-            if (rhsValue->getType() != fieldType) {
-                if (rhsValue->getType()->isIntegerTy() && fieldType->isIntegerTy()) {
-                    rhsValue = builder->CreateIntCast(rhsValue, fieldType, true);
-                }
-            }
-
-            builder->CreateStore(rhsValue, elementPtr);
-            lastValue = rhsValue;
-        } else {
-            throw std::runtime_error("Invalid assignment target");
         }
+
+        b::ast::Type targetType;
+        llvm::Value* targetPtr = addressOf(node->left.get(), &targetType);
+        rhsValue = coerceValue(rhsValue, arcTypeToLLVM(targetType));
+
+        builder->CreateStore(rhsValue, targetPtr);
+        lastValue = rhsValue;
         return;
     }
+
+    checkEnumOperands(node);
 
     node->left->accept(this);
     llvm::Value* lhs = lastValue;
@@ -2539,12 +3378,36 @@ void CodeGenerator::visit(b::ast::BinaryOp* node) {
         case b::ast::BinaryOp::Operator::BITWISE_XOR:
             lastValue = builder->CreateXor(lhs, rhs);
             break;
+        case b::ast::BinaryOp::Operator::SHIFT_LEFT:
+            if (isFloat) {
+                throw b::CompilerException("Shift operators require integer operands");
+            }
+            lastValue = builder->CreateShl(lhs, rhs);
+            break;
+        case b::ast::BinaryOp::Operator::SHIFT_RIGHT:
+            if (isFloat) {
+                throw b::CompilerException("Shift operators require integer operands");
+            }
+            lastValue = builder->CreateAShr(lhs, rhs);
+            break;
         default:
             throw std::runtime_error("Unknown binary operator");
     }
 }
 
 void CodeGenerator::visit(b::ast::UnaryOp* node) {
+    if (node->op == b::ast::UnaryOp::Operator::DEREF) {
+        b::ast::Type valueType;
+        llvm::Value* pointer = addressOf(node, &valueType);
+        lastValue = builder->CreateLoad(arcTypeToLLVM(valueType), pointer);
+        return;
+    }
+
+    if (node->op == b::ast::UnaryOp::Operator::ADDRESS_OF) {
+        lastValue = addressOf(node->operand.get(), nullptr);
+        return;
+    }
+
     node->operand->accept(this);
     llvm::Value* operand = lastValue;
 
@@ -2560,39 +3423,8 @@ void CodeGenerator::visit(b::ast::UnaryOp* node) {
         case b::ast::UnaryOp::Operator::BITWISE_NOT:
             lastValue = builder->CreateNot(operand);
             break;
-        case b::ast::UnaryOp::Operator::DEREF: {
-            if (auto* ident = dynamic_cast<b::ast::Identifier*>(node->operand.get())) {
-                auto arcTypeIt = arcVariableTypes.find(ident->name);
-                if (arcTypeIt == arcVariableTypes.end()) {
-                    throw std::runtime_error("Unknown variable: " + ident->name);
-                }
-
-                b::ast::Type derefArcType = derefType(arcTypeIt->second);
-                llvm::Type* derefLLVMType = arcTypeToLLVM(derefArcType);
-
-                llvm::Value* ptrAddr = getVariable(ident->name);
-                auto llvmTypeIt = variableTypes.find(ident->name);
-                llvm::Type* ptrLLVMType = llvmTypeIt->second;
-
-                llvm::Value* ptrVal = builder->CreateLoad(ptrLLVMType, ptrAddr);
-                lastValue = builder->CreateLoad(derefLLVMType, ptrVal);
-            } else {
-                node->operand->accept(this);
-                lastValue = builder->CreateLoad(
-                    llvm::Type::getInt8Ty(*context),
-                    lastValue
-                );
-            }
+        default:
             break;
-        }
-        case b::ast::UnaryOp::Operator::ADDRESS_OF: {
-            if (auto* ident = dynamic_cast<b::ast::Identifier*>(node->operand.get())) {
-                lastValue = getVariable(ident->name);
-            } else {
-                throw std::runtime_error("Cannot take address of non-lvalue");
-            }
-            break;
-        }
     }
 }
 
@@ -2723,10 +3555,24 @@ void CodeGenerator::visit(b::ast::FunctionCall* node) {
     } else {
         func = module->getFunction(node->functionName);
         if (!func) {
-            throw std::runtime_error("Undefined function: " + node->functionName);
+            throw b::CompilerException("Undefined function: " + node->functionName);
         }
         funcType = func->getFunctionType();
         calleeValue = func;
+
+        auto paramIt = functionParamTypes.find(node->functionName);
+        if (paramIt != functionParamTypes.end()) {
+            if (paramIt->second.size() != node->arguments.size()) {
+                throw b::CompilerException(node->functionName + " expects " +
+                                           std::to_string(paramIt->second.size()) +
+                                           " argument(s), got " +
+                                           std::to_string(node->arguments.size()));
+            }
+            for (size_t i = 0; i < node->arguments.size(); ++i) {
+                checkEnumCompatible(paramIt->second[i], node->arguments[i].get(),
+                                    "argument " + std::to_string(i + 1) + " of " + node->functionName);
+            }
+        }
     }
 
     std::vector<llvm::Value*> args;
@@ -2762,122 +3608,305 @@ void CodeGenerator::visit(b::ast::FunctionCall* node) {
     lastValue = builder->CreateCall(funcType, calleeValue, args);
 }
 
-llvm::Value* CodeGenerator::getMemberFieldPtr(b::ast::MemberAccess* node, llvm::Type** outFieldType) {
-    auto* ident = dynamic_cast<b::ast::Identifier*>(node->object.get());
-    if (!ident) {
-        throw std::runtime_error("Invalid member access");
+bool CodeGenerator::inferType(b::ast::Expression* expr, b::ast::Type& outType) {
+    if (auto* literal = dynamic_cast<b::ast::Literal*>(expr)) {
+        b::ast::Type type;
+        type.pointerLevel = 0;
+        switch (literal->kind) {
+            case b::ast::Literal::Kind::INTEGER:
+                type.base = b::ast::PrimitiveType::INT;
+                type.enumName = literal->enumName;
+                break;
+            case b::ast::Literal::Kind::FLOAT:
+                type.base = b::ast::PrimitiveType::FLOAT;
+                break;
+            case b::ast::Literal::Kind::STRING:
+                type.base = b::ast::PrimitiveType::CHAR;
+                type.pointerLevel = 1;
+                break;
+            case b::ast::Literal::Kind::BOOLEAN:
+                type.base = b::ast::PrimitiveType::BOOL;
+                break;
+        }
+        outType = type;
+        return true;
     }
 
-    auto it = variableTypes.find(ident->name);
-    if (it == variableTypes.end()) {
-        throw std::runtime_error("Unknown variable type: " + ident->name);
+    if (dynamic_cast<b::ast::SizeofExpr*>(expr)) {
+        outType = b::ast::Type();
+        outType.base = b::ast::PrimitiveType::INT;
+        return true;
     }
 
-    llvm::Type* objectType = it->second;
-    llvm::StructType* structType = nullptr;
-    llvm::Value* objectPtr = nullptr;
+    if (auto* ident = dynamic_cast<b::ast::Identifier*>(expr)) {
+        auto it = arcVariableTypes.find(ident->name);
+        if (it != arcVariableTypes.end()) {
+            outType = it->second;
+            return true;
+        }
+        return false;
+    }
 
-    if (auto* st = llvm::dyn_cast<llvm::StructType>(objectType)) {
-        structType = st;
-        objectPtr = getVariable(ident->name);
-    } else if (auto* pt = llvm::dyn_cast<llvm::PointerType>(objectType)) {
-        (void)pt;
-        auto arcIt = arcVariableTypes.find(ident->name);
-        if (arcIt != arcVariableTypes.end()) {
-            b::ast::Type elemType = this->derefType(arcIt->second);
-            if (elemType.isStruct()) {
-                auto structTypeIt = structTypes.find(elemType.structName);
-                if (structTypeIt != structTypes.end()) {
-                    structType = structTypeIt->second;
+    if (auto* cast = dynamic_cast<b::ast::CastExpr*>(expr)) {
+        outType = cast->targetType;
+        return true;
+    }
+
+    if (auto* call = dynamic_cast<b::ast::FunctionCall*>(expr)) {
+        auto it = functionReturnTypes.find(call->functionName);
+        if (it != functionReturnTypes.end()) {
+            outType = it->second;
+            return true;
+        }
+        return false;
+    }
+
+    if (auto* member = dynamic_cast<b::ast::MemberAccess*>(expr)) {
+        b::ast::Type objectType;
+        if (!inferType(member->object.get(), objectType) || objectType.structName.empty()) {
+            return false;
+        }
+        auto structIt = structFieldTypes.find(objectType.structName);
+        if (structIt == structFieldTypes.end()) {
+            return false;
+        }
+        auto fieldIt = structIt->second.find(member->member);
+        if (fieldIt == structIt->second.end()) {
+            return false;
+        }
+        outType = fieldIt->second;
+        return true;
+    }
+
+    if (auto* array = dynamic_cast<b::ast::ArrayAccess*>(expr)) {
+        b::ast::Type arrayType;
+        if (!inferType(array->array.get(), arrayType) || arrayType.pointerLevel == 0) {
+            return false;
+        }
+        outType = derefType(arrayType);
+        return true;
+    }
+
+    if (auto* unary = dynamic_cast<b::ast::UnaryOp*>(expr)) {
+        b::ast::Type operandType;
+        switch (unary->op) {
+            case b::ast::UnaryOp::Operator::DEREF:
+                if (!inferType(unary->operand.get(), operandType) || operandType.pointerLevel == 0) {
+                    return false;
                 }
+                outType = derefType(operandType);
+                return true;
+            case b::ast::UnaryOp::Operator::ADDRESS_OF:
+                if (!inferType(unary->operand.get(), operandType)) {
+                    return false;
+                }
+                outType = operandType;
+                outType.pointerLevel++;
+                return true;
+            case b::ast::UnaryOp::Operator::NOT:
+                outType = b::ast::Type();
+                outType.base = b::ast::PrimitiveType::BOOL;
+                return true;
+            default:
+                return inferType(unary->operand.get(), outType);
+        }
+    }
+
+    if (auto* binary = dynamic_cast<b::ast::BinaryOp*>(expr)) {
+        switch (binary->op) {
+            case b::ast::BinaryOp::Operator::EQUAL:
+            case b::ast::BinaryOp::Operator::NOT_EQUAL:
+            case b::ast::BinaryOp::Operator::LESS:
+            case b::ast::BinaryOp::Operator::LESS_EQUAL:
+            case b::ast::BinaryOp::Operator::GREATER:
+            case b::ast::BinaryOp::Operator::GREATER_EQUAL:
+            case b::ast::BinaryOp::Operator::LOGICAL_AND:
+            case b::ast::BinaryOp::Operator::LOGICAL_OR:
+                outType = b::ast::Type();
+                outType.base = b::ast::PrimitiveType::BOOL;
+                return true;
+            default:
+                return inferType(binary->left.get(), outType);
+        }
+    }
+
+    return false;
+}
+
+llvm::Value* CodeGenerator::addressOf(b::ast::Expression* expr, b::ast::Type* outType) {
+    if (auto* ident = dynamic_cast<b::ast::Identifier*>(expr)) {
+        b::ast::Type type;
+        if (outType) {
+            if (!inferType(expr, type)) {
+                throw b::CompilerException("Unknown variable: " + ident->name);
+            }
+            *outType = type;
+        }
+        return getVariable(ident->name);
+    }
+
+    if (auto* member = dynamic_cast<b::ast::MemberAccess*>(expr)) {
+        b::ast::Type objectType;
+        if (!inferType(member->object.get(), objectType)) {
+            throw b::CompilerException("Cannot determine the type of the value before '." +
+                                       member->member + "'");
+        }
+        if (objectType.structName.empty()) {
+            throw b::CompilerException("'" + b::ast::typeToString(objectType) +
+                                       "' is not a struct, so it has no field '" + member->member + "'");
+        }
+        if (objectType.pointerLevel > 1) {
+            throw b::CompilerException("Cannot access field '" + member->member +
+                                       "' through a multi-level pointer");
+        }
+
+        llvm::Value* basePtr = nullptr;
+        if (objectType.pointerLevel == 0) {
+            basePtr = addressOf(member->object.get(), nullptr);
+        } else {
+            member->object->accept(this);
+            basePtr = lastValue;
+        }
+
+        auto structTypeIt = structTypes.find(objectType.structName);
+        auto fieldNamesIt = structFields.find(objectType.structName);
+        if (structTypeIt == structTypes.end() || fieldNamesIt == structFields.end()) {
+            throw b::CompilerException("Unknown struct type: " + objectType.structName);
+        }
+
+        unsigned fieldIndex = 0;
+        bool found = false;
+        for (unsigned i = 0; i < fieldNamesIt->second.size(); ++i) {
+            if (fieldNamesIt->second[i] == member->member) {
+                fieldIndex = i;
+                found = true;
+                break;
             }
         }
-        node->object->accept(this);
-        objectPtr = lastValue;
+        if (!found) {
+            throw b::CompilerException("Struct '" + objectType.structName + "' has no field '" +
+                                       member->member + "'");
+        }
+
+        if (outType) {
+            *outType = structFieldTypes[objectType.structName][member->member];
+        }
+        return builder->CreateStructGEP(structTypeIt->second, basePtr, fieldIndex);
     }
 
-    if (!structType) {
-        throw std::runtime_error("Object is not a struct type");
+    if (auto* array = dynamic_cast<b::ast::ArrayAccess*>(expr)) {
+        b::ast::Type arrayType;
+        if (!inferType(array->array.get(), arrayType)) {
+            throw b::CompilerException("Cannot determine the element type of this index expression");
+        }
+        if (arrayType.pointerLevel == 0) {
+            throw b::CompilerException("Cannot index a value of type '" +
+                                       b::ast::typeToString(arrayType) + "'");
+        }
+
+        array->array->accept(this);
+        llvm::Value* basePtr = lastValue;
+
+        array->index->accept(this);
+        llvm::Value* indexValue = lastValue;
+
+        b::ast::Type elementType = derefType(arrayType);
+        if (outType) {
+            *outType = elementType;
+        }
+        return builder->CreateGEP(arcTypeToLLVM(elementType), basePtr, indexValue);
     }
 
-    auto structIt = structFields.find(structType->getName().str());
-    if (structIt == structFields.end()) {
-        throw std::runtime_error("Unknown struct type: " + structType->getName().str());
-    }
+    if (auto* unary = dynamic_cast<b::ast::UnaryOp*>(expr)) {
+        if (unary->op == b::ast::UnaryOp::Operator::DEREF) {
+            b::ast::Type operandType;
+            if (!inferType(unary->operand.get(), operandType)) {
+                throw b::CompilerException("Cannot determine the type of the dereferenced value");
+            }
+            if (operandType.pointerLevel == 0) {
+                throw b::CompilerException("Cannot dereference a value of type '" +
+                                           b::ast::typeToString(operandType) + "'");
+            }
 
-    unsigned fieldIndex = 0;
-    bool found = false;
-    for (unsigned i = 0; i < structIt->second.size(); ++i) {
-        if (structIt->second[i] == node->member) {
-            fieldIndex = i;
-            found = true;
-            break;
+            unary->operand->accept(this);
+            llvm::Value* pointerValue = lastValue;
+
+            if (outType) {
+                *outType = derefType(operandType);
+            }
+            return pointerValue;
         }
     }
 
-    if (!found) {
-        throw std::runtime_error("Unknown struct field: " + node->member);
+    throw b::CompilerException("Expression cannot be used as an assignment target");
+}
+
+llvm::Value* CodeGenerator::coerceValue(llvm::Value* value, llvm::Type* targetType) {
+    llvm::Type* sourceType = value->getType();
+    if (sourceType == targetType) {
+        return value;
     }
 
-    *outFieldType = structType->getElementType(fieldIndex);
-    return builder->CreateStructGEP(structType, objectPtr, fieldIndex);
+    if (sourceType->isIntegerTy() && targetType->isIntegerTy()) {
+        return builder->CreateIntCast(value, targetType, true);
+    }
+    if (sourceType->isIntegerTy() && targetType->isFloatingPointTy()) {
+        return builder->CreateSIToFP(value, targetType);
+    }
+    if (sourceType->isFloatingPointTy() && targetType->isIntegerTy()) {
+        return builder->CreateFPToSI(value, targetType);
+    }
+    if (sourceType->isFloatingPointTy() && targetType->isFloatingPointTy()) {
+        return builder->CreateFPCast(value, targetType);
+    }
+    if (sourceType->isIntegerTy() && targetType->isPointerTy()) {
+        if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(value)) {
+            if (constInt->isZero()) {
+                return llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(targetType));
+            }
+        }
+    }
+
+    return value;
 }
 
 void CodeGenerator::visit(b::ast::MemberAccess* node) {
-    llvm::Type* fieldType = nullptr;
-    llvm::Value* elementPtr = getMemberFieldPtr(node, &fieldType);
-    lastValue = builder->CreateLoad(fieldType, elementPtr);
+    b::ast::Type fieldType;
+    llvm::Value* fieldPtr = addressOf(node, &fieldType);
+    lastValue = builder->CreateLoad(arcTypeToLLVM(fieldType), fieldPtr);
 }
 
 void CodeGenerator::visit(b::ast::ArrayAccess* node) {
-    node->array->accept(this);
-    llvm::Value* arrayPtr = lastValue;
-
-    node->index->accept(this);
-    llvm::Value* indexVal = lastValue;
-
-    auto arcTypeIt = arcVariableTypes.find(
-        dynamic_cast<b::ast::Identifier*>(node->array.get()) ?
-        dynamic_cast<b::ast::Identifier*>(node->array.get())->name : ""
-    );
-
-    if (arcTypeIt != arcVariableTypes.end()) {
-        b::ast::Type elemType = derefType(arcTypeIt->second);
-        llvm::Type* elemLLVMType = arcTypeToLLVM(elemType);
-        llvm::Value* elemPtr = builder->CreateGEP(elemLLVMType, arrayPtr, indexVal);
-        lastValue = builder->CreateLoad(elemLLVMType, elemPtr);
-    } else {
-        throw std::runtime_error("Cannot determine array element type");
-    }
+    b::ast::Type elementType;
+    llvm::Value* elementPtr = addressOf(node, &elementType);
+    lastValue = builder->CreateLoad(arcTypeToLLVM(elementType), elementPtr);
 }
 
 void CodeGenerator::visit(b::ast::VariableDecl* node) {
     llvm::Type* type = arcTypeToLLVM(node->type);
+
+    if (node->arraySize > 0) {
+        b::ast::Type elementType = derefType(node->type);
+        llvm::Type* elementLLVMType = arcTypeToLLVM(elementType);
+        llvm::Value* storage = builder->CreateAlloca(
+            llvm::ArrayType::get(elementLLVMType, node->arraySize)
+        );
+
+        llvm::AllocaInst* pointerSlot = builder->CreateAlloca(type);
+        builder->CreateStore(storage, pointerSlot);
+
+        setVariable(node->name, pointerSlot);
+        variableTypes[node->name] = type;
+        arcVariableTypes[node->name] = node->type;
+        return;
+    }
+
     llvm::AllocaInst* alloca = builder->CreateAlloca(type);
 
     if (node->initializer) {
         node->initializer->accept(this);
-        llvm::Value* initValue = lastValue;
-
-        if (initValue->getType() != type) {
-            if (initValue->getType()->isIntegerTy() && type->isIntegerTy()) {
-                initValue = builder->CreateIntCast(initValue, type, true);
-            } else if (initValue->getType()->isIntegerTy() && type->isFloatingPointTy()) {
-                initValue = builder->CreateSIToFP(initValue, type);
-            } else if (initValue->getType()->isFloatingPointTy() && type->isIntegerTy()) {
-                initValue = builder->CreateFPToSI(initValue, type);
-            } else if (initValue->getType()->isFloatingPointTy() && type->isFloatingPointTy()) {
-                initValue = builder->CreateFPCast(initValue, type);
-            } else if (initValue->getType()->isIntegerTy() && type->isPointerTy()) {
-                if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(initValue)) {
-                    if (constInt->isZero()) {
-                        initValue = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(type));
-                    }
-                }
-            }
-        }
-
-        builder->CreateStore(initValue, alloca);
+        checkEnumCompatible(node->type, node->initializer.get(), "variable '" + node->name + "'");
+        builder->CreateStore(coerceValue(lastValue, type), alloca);
     }
 
     setVariable(node->name, alloca);
@@ -2890,6 +3919,10 @@ void CodeGenerator::visit(b::ast::VariableDecl* node) {
 
 void CodeGenerator::visit(b::ast::ReturnStmt* node) {
     if (node->value) {
+        if (currentReturnType.isVoid()) {
+            throw b::CompilerException("Cannot return a value from a void function");
+        }
+        checkEnumCompatible(currentReturnType, node->value.get(), "return value");
         node->value->accept(this);
         llvm::Value* retVal = lastValue;
 
@@ -3043,6 +4076,51 @@ void CodeGenerator::visit(b::ast::ContinueStmt* node) {
 }
 
 void CodeGenerator::visit(b::ast::SwitchStmt* node) {
+    std::string conditionEnum = enumTypeOf(node->condition.get());
+    bool hasDefault = false;
+    std::unordered_set<std::string> coveredConstants;
+
+    for (const auto& caseItem : node->cases) {
+        if (caseItem.isDefault) {
+            hasDefault = true;
+            continue;
+        }
+
+        std::string caseEnum = enumTypeOf(caseItem.value.get());
+        if (conditionEnum != caseEnum) {
+            if (conditionEnum.empty()) {
+                throw b::CompilerException("Cannot use a constant of enum '" + caseEnum +
+                                           "' in a switch over a non-enum value");
+            }
+            throw b::CompilerException("Switch over enum '" + conditionEnum +
+                                       "' requires case labels of that enum");
+        }
+
+        if (auto* literal = dynamic_cast<b::ast::Literal*>(caseItem.value.get())) {
+            coveredConstants.insert(literal->value);
+        }
+    }
+
+    if (!conditionEnum.empty() && !hasDefault) {
+        auto membersIt = enumMembers.find(conditionEnum);
+        if (membersIt != enumMembers.end()) {
+            std::string missing;
+            for (const auto& constant : membersIt->second) {
+                if (!coveredConstants.count(std::to_string(constant.value))) {
+                    if (!missing.empty()) {
+                        missing += ", ";
+                    }
+                    missing += constant.name;
+                }
+            }
+            if (!missing.empty()) {
+                std::cerr << "Warning: switch over enum '" << conditionEnum
+                          << "' does not handle " << missing
+                          << " and has no default case" << std::endl;
+            }
+        }
+    }
+
     node->condition->accept(this);
     llvm::Value* switchValue = lastValue;
 
@@ -3087,16 +4165,24 @@ void CodeGenerator::visit(b::ast::SwitchStmt* node) {
 }
 
 void CodeGenerator::visit(b::ast::FunctionDecl* node) {
-    llvm::FunctionType* funcType = createFunctionType(node);
-    llvm::Function* function = llvm::Function::Create(
-        funcType, llvm::Function::ExternalLinkage, node->name, module.get()
-    );
+    llvm::Function* function = module->getFunction(node->name);
+    if (!function) {
+        throw std::runtime_error("Function was not declared: " + node->name);
+    }
 
     llvm::BasicBlock* entryBlock = llvm::BasicBlock::Create(*context, "entry", function);
     builder->SetInsertPoint(entryBlock);
 
     currentFunction = function;
+    currentReturnType = node->returnType;
     variables.clear();
+    variableTypes.clear();
+    arcVariableTypes.clear();
+
+    for (const auto& globalType : globalVariableTypes) {
+        arcVariableTypes[globalType.first] = globalType.second;
+        variableTypes[globalType.first] = arcTypeToLLVM(globalType.second);
+    }
 
     auto argIt = function->arg_begin();
     for (const auto& param : node->parameters) {
@@ -3120,20 +4206,43 @@ void CodeGenerator::visit(b::ast::FunctionDecl* node) {
 }
 
 void CodeGenerator::visit(b::ast::StructDecl* node) {
-    std::vector<llvm::Type*> fieldTypes;
-    std::vector<std::string> fieldNames;
-
-    for (const auto& field : node->fields) {
-        fieldTypes.push_back(arcTypeToLLVM(field.type));
-        fieldNames.push_back(field.name);
+    auto it = structTypes.find(node->name);
+    if (it == structTypes.end()) {
+        throw std::runtime_error("Unknown struct type: " + node->name);
     }
 
-    llvm::StructType* structType = llvm::StructType::create(*context, fieldTypes, node->name);
-    structTypes[node->name] = structType;
+    std::vector<llvm::Type*> fieldTypes;
+    std::vector<std::string> fieldNames;
+    std::unordered_map<std::string, b::ast::Type> fieldTypeMap;
+
+    for (const auto& field : node->fields) {
+        if (field.type.isStruct() && field.type.pointerLevel == 0 &&
+            field.type.structName == node->name) {
+            throw b::CompilerException("Struct '" + node->name + "' cannot contain itself by value; use " +
+                                       node->name + "* instead");
+        }
+        fieldTypes.push_back(arcTypeToLLVM(field.type));
+        fieldNames.push_back(field.name);
+        fieldTypeMap[field.name] = field.type;
+    }
+
+    it->second->setBody(fieldTypes);
     structFields[node->name] = fieldNames;
+    structFieldTypes[node->name] = std::move(fieldTypeMap);
 }
 
 void CodeGenerator::visit(b::ast::Program* node) {
+    for (const auto& enumDecl : node->enums) {
+        enumMembers[enumDecl.name] = enumDecl.constants;
+    }
+
+    for (const auto& strct : node->structs) {
+        if (structTypes.count(strct->name)) {
+            throw b::CompilerException("Duplicate struct definition: " + strct->name);
+        }
+        structTypes[strct->name] = llvm::StructType::create(*context, strct->name);
+    }
+
     for (const auto& strct : node->structs) {
         strct->accept(this);
     }
@@ -3148,9 +4257,15 @@ void CodeGenerator::visit(b::ast::Program* node) {
     }
 
     for (const auto& globalVar : node->globalVariables) {
+        if (globalVariables.count(globalVar.name)) {
+            throw b::CompilerException("Duplicate global variable: " + globalVar.name);
+        }
+
         llvm::Type* llvmType = arcTypeToLLVM(globalVar.type);
         llvm::Constant* initializer = nullptr;
         if (globalVar.initializer) {
+            checkEnumCompatible(globalVar.type, globalVar.initializer.get(),
+                                "global variable '" + globalVar.name + "'");
             globalVar.initializer->accept(this);
             initializer = llvm::dyn_cast<llvm::Constant>(lastValue);
             if (!initializer) {
@@ -3172,13 +4287,38 @@ void CodeGenerator::visit(b::ast::Program* node) {
         auto gv = new llvm::GlobalVariable(*module, llvmType, globalVar.isConst,
                                            llvm::GlobalValue::InternalLinkage, initializer, globalVar.name);
         globalVariables[globalVar.name] = gv;
+        globalVariableTypes[globalVar.name] = globalVar.type;
         if (globalVar.isConst) {
             constVariables.insert(globalVar.name);
         }
     }
 
     for (const auto& func : node->functions) {
+        if (functionReturnTypes.count(func->name)) {
+            throw b::CompilerException("Duplicate definition of function '" + func->name + "'");
+        }
+        if (module->getFunction(func->name)) {
+            throw b::CompilerException("Function '" + func->name +
+                                       "' collides with a built-in of the same name");
+        }
+
+        llvm::FunctionType* funcType = createFunctionType(func.get());
+        llvm::Function::Create(funcType, llvm::Function::ExternalLinkage, func->name, module.get());
+
+        functionReturnTypes[func->name] = func->returnType;
+        std::vector<b::ast::Type> paramTypes;
+        for (const auto& param : func->parameters) {
+            paramTypes.push_back(param.type);
+        }
+        functionParamTypes[func->name] = std::move(paramTypes);
+    }
+
+    for (const auto& func : node->functions) {
         func->accept(this);
+    }
+
+    if (!module->getFunction("main")) {
+        throw b::CompilerException("No 'main' function found");
     }
 }
 
@@ -3194,8 +4334,164 @@ std::string readFile(const std::string& filepath) {
     return buffer.str();
 }
 
+class ModuleLoader {
+public:
+    std::vector<b::lexer::Token> load(const std::string& entryPath);
+    const std::vector<std::string>& modules() const { return order; }
+
+private:
+    struct ImportRequest {
+        std::string path;
+        int line;
+    };
+
+    std::unordered_set<std::string> loaded;
+    std::unordered_set<std::string> loading;
+    std::vector<std::string> order;
+    std::vector<b::lexer::Token> tokens;
+
+    void loadFile(const std::string& path, const std::string& importedFrom, int importLine);
+    static std::string resolve(const std::string& raw, const fs::path& importerDir);
+    static std::string displayName(const fs::path& path);
+};
+
+std::string ModuleLoader::displayName(const fs::path& path) {
+    std::error_code ec;
+    fs::path relative = fs::relative(path, fs::current_path(), ec);
+    if (ec || relative.empty() || relative.string().rfind("..", 0) == 0) {
+        return path.string();
+    }
+    return relative.string();
+}
+
+std::string ModuleLoader::resolve(const std::string& raw, const fs::path& importerDir) {
+    std::vector<fs::path> candidates;
+    fs::path rawPath(raw);
+
+    if (rawPath.is_absolute()) {
+        candidates.push_back(rawPath);
+    } else {
+        candidates.push_back(importerDir / rawPath);
+        candidates.push_back(fs::current_path() / rawPath);
+    }
+
+    size_t fixedCount = candidates.size();
+    if (rawPath.extension() != ".b") {
+        for (size_t i = 0; i < fixedCount; ++i) {
+            fs::path withExtension = candidates[i];
+            withExtension += ".b";
+            candidates.push_back(withExtension);
+        }
+    }
+
+    for (const auto& candidate : candidates) {
+        std::error_code ec;
+        if (fs::is_regular_file(candidate, ec)) {
+            fs::path canonical = fs::weakly_canonical(candidate, ec);
+            return ec ? candidate.string() : canonical.string();
+        }
+    }
+
+    return "";
+}
+
+void ModuleLoader::loadFile(const std::string& path, const std::string& importedFrom, int importLine) {
+    std::error_code ec;
+    fs::path canonicalPath = fs::weakly_canonical(fs::path(path), ec);
+    std::string key = ec ? path : canonicalPath.string();
+
+    if (loaded.count(key) || loading.count(key)) {
+        return;
+    }
+    loading.insert(key);
+
+    std::string name = displayName(key);
+    std::string source;
+    try {
+        source = readFile(key);
+    } catch (const b::CompilerException&) {
+        if (importedFrom.empty()) {
+            throw;
+        }
+        throw b::CompilerException("Cannot open module '" + path + "' imported from " +
+                                   importedFrom + ":" + std::to_string(importLine));
+    }
+
+    std::vector<b::lexer::Token> fileTokens;
+    try {
+        b::lexer::Lexer lexer(source);
+        fileTokens = lexer.tokenize();
+    } catch (const std::exception& ex) {
+        throw b::CompilerException(std::string(ex.what()) + " in " + name);
+    }
+
+    std::vector<b::lexer::Token> kept;
+    std::vector<ImportRequest> imports;
+    int depth = 0;
+
+    for (size_t i = 0; i < fileTokens.size(); ++i) {
+        b::lexer::Token token = fileTokens[i];
+
+        if (token.type == b::lexer::TokenType::KW_IMPORT) {
+            if (depth != 0) {
+                throw b::CompilerException("import must appear at the top level (" + name +
+                                           ":" + std::to_string(token.line) + ")");
+            }
+            if (i + 2 >= fileTokens.size() ||
+                fileTokens[i + 1].type != b::lexer::TokenType::STRING ||
+                fileTokens[i + 2].type != b::lexer::TokenType::SEMICOLON) {
+                throw b::CompilerException("Expected import \"path/to/module.b\"; in " + name +
+                                           ":" + std::to_string(token.line));
+            }
+            imports.push_back({fileTokens[i + 1].value, fileTokens[i + 1].line});
+            i += 2;
+            continue;
+        }
+
+        if (token.type == b::lexer::TokenType::LBRACE) {
+            depth++;
+        } else if (token.type == b::lexer::TokenType::RBRACE) {
+            depth--;
+        }
+
+        if (token.type == b::lexer::TokenType::EOF_TOKEN) {
+            continue;
+        }
+
+        token.file = name;
+        kept.push_back(std::move(token));
+    }
+
+    fs::path importerDir = fs::path(key).parent_path();
+    for (const auto& request : imports) {
+        std::string resolved = resolve(request.path, importerDir);
+        if (resolved.empty()) {
+            throw b::CompilerException("Cannot find module '" + request.path + "' imported from " +
+                                       name + ":" + std::to_string(request.line));
+        }
+        loadFile(resolved, name, request.line);
+    }
+
+    tokens.insert(tokens.end(), kept.begin(), kept.end());
+
+    loading.erase(key);
+    loaded.insert(key);
+    order.push_back(name);
+}
+
+std::vector<b::lexer::Token> ModuleLoader::load(const std::string& entryPath) {
+    tokens.clear();
+    loaded.clear();
+    loading.clear();
+    order.clear();
+
+    loadFile(entryPath, "", 0);
+    tokens.push_back(b::lexer::Token(b::lexer::TokenType::EOF_TOKEN, "", "", 0, 0));
+    return tokens;
+}
+
 void printUsage(const char* programName) {
-    std::cerr << "Usage: " << programName << " <source.arc>" << std::endl;
+    std::cerr << "Usage: " << programName << " <source.b> [--debug]" << std::endl;
 }
 
 void printVersion() {
@@ -3206,6 +4502,10 @@ class ASTPrinter : public b::ast::ASTVisitor {
 public:
     void visit(b::ast::Literal* node) override {
         std::cout << "Literal(" << node->value << ")";
+    }
+
+    void visit(b::ast::SizeofExpr* node) override {
+        std::cout << "Sizeof(" << b::ast::typeToString(node->targetType) << ")";
     }
 
     void visit(b::ast::Identifier* node) override {
@@ -3322,20 +4622,20 @@ int main(int argc, char* argv[]) {
     }
 
     if (firstArg == "--update") {
-        std::cout << "Updating Arc..." << std::endl;
+        std::cout << "Updating B..." << std::endl;
 #if defined(_WIN32)
         std::string command =
             "powershell -NoProfile -ExecutionPolicy Bypass -Command "
-            "\"if (Test-Path \\\"$env:USERPROFILE\\.arc\\repo\\get.ps1\\\") { "
+            "\"if (Test-Path \\\"$env:USERPROFILE\\.b\\repo\\get.ps1\\\") { "
             "powershell -ExecutionPolicy Bypass -File "
-            "\\\"$env:USERPROFILE\\.arc\\repo\\get.ps1\\\" -Action update "
-            "} else { irm https://raw.githubusercontent.com/ital87/Arc/1.0.0/get.ps1 | iex }\"";
+            "\\\"$env:USERPROFILE\\.b\\repo\\get.ps1\\\" -Action update "
+            "} else { irm https://raw.githubusercontent.com/ital87/B/main/get.ps1 | iex }\"";
 #else
         std::string command =
-            "bash -c 'if [ -f \"$HOME/.arc/repo/get.sh\" ]; then "
-            "bash \"$HOME/.arc/repo/get.sh\" update; "
+            "bash -c 'if [ -f \"$HOME/.b/repo/get.sh\" ]; then "
+            "bash \"$HOME/.b/repo/get.sh\" update; "
             "else "
-            "curl -fsSL https://raw.githubusercontent.com/ital87/Arc/1.0.0/get.sh | bash; "
+            "curl -fsSL https://raw.githubusercontent.com/ital87/B/main/get.sh | bash; "
             "fi'";
 #endif
         int result = std::system(command.c_str());
@@ -3346,12 +4646,17 @@ int main(int argc, char* argv[]) {
     bool debugMode = (argc > 2 && std::string(argv[2]) == "--debug");
 
     try {
-        std::cout << "[1/4] Reading source file..." << std::endl;
-        std::string source = readFile(filepath);
+        std::cout << "[1/4] Loading modules..." << std::endl;
+        ModuleLoader loader;
+        auto tokens = loader.load(filepath);
 
         std::cout << "[2/4] Lexing..." << std::endl;
-        b::lexer::Lexer lexer(source);
-        auto tokens = lexer.tokenize();
+        std::cout << "      Modules: " << loader.modules().size() << std::endl;
+        if (debugMode) {
+            for (const auto& moduleName : loader.modules()) {
+                std::cout << "        " << moduleName << std::endl;
+            }
+        }
         std::cout << "      Tokens: " << tokens.size() - 1 << std::endl;
 
         std::cout << "[3/4] Parsing..." << std::endl;

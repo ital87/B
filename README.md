@@ -34,6 +34,14 @@ b hello.b
 ./hello
 ```
 
+For a project with several files, compile the file that contains `main` — every
+module it imports is pulled in automatically:
+
+```bash
+b examples/project/main.b
+./main
+```
+
 ---
 
 ## Project Status
@@ -43,32 +51,27 @@ b hello.b
 - **Parser:** Recursive-descent with operator precedence
 - **Types:** `int`, `float`, `double`, `bool`, `char`, `string`, `void`, `enum`, function pointers (via `typedef`), pointers (`T*`), arrays (via pointer indexing)
 - **Functions:** Declarations, parameters, return values, recursion, function pointers as first-class values
+- **Generics:** Generic functions and structs (`T maxOf<T>(T a, T b)`, `struct Box<T>`), compiled by monomorphization — one specialized native function per type, zero runtime cost
 - **Control Flow:** `if`/`else`, `while`, `for`, `switch`/`case`/`default`, `break`, `continue` — any value is truthy-tested against zero
-- **Memory:** `malloc`, `free`, pointers (`&`, `*`, `arr[i]`), full pointer arithmetic
-- **Structs:** Declaration, field access (`p.x` and `p->x` both work)
+- **Memory:** `malloc`, `free`, `sizeof(T)`, pointers (`&`, `*`, `arr[i]`), full pointer arithmetic, fixed-size local arrays (`int buf[64];`)
+- **Structs:** Declaration, nesting by value, field access (`p.x` and `p->x` both work), arbitrary chains (`a->b->c.d`)
 - **Global Variables:** Top-level `int x = 5;` with optional `const` keyword
 - **Const:** Local and global const variables with compile-time assignment blocking
-- **I/O:** `print()`, `println()` (auto-format), `printf()`, `scanf()`, file I/O (`fopen`, `fclose`, `fread`, etc.)
+- **I/O:** `print()`, `println()` (auto-format), `printf()`, `scanf()`, file I/O (`fopen`, `fclose`, `fread`, `fwrite`, `fprintf`, `fgets`, `fseek`, `ftell`)
 - **Strings:** `strlen`, `strcmp`, `strcpy`, `atoi`, `itoa`
-- **Type Casting:** C-style `(type)expr` between numeric types, `char`, and pointers
+- **Type Casting:** C-style `(type)expr` between numeric types, `char`, enums, and pointers
 - **Float/Double:** Full arithmetic and comparison with mixed int/float expressions
 - **Character Literals:** `'A'`, `'\n'`, `'\t'`, `'\0'`, etc. with escape sequences
-- **Enums:** Compile-time named constants with auto-increment
+- **Enums:** Distinct types — an `enum` is not an `int`, mixing them is a compile error, and a `switch` over an enum warns about unhandled cases
 - **Switch Statements:** Full support for multiple cases, default, and fall-through
-- **Import System:** `import "path/to/file.b";` with cycle detection (prepared for modular code)
+- **Module System:** `import "path/to/file.b";` resolves imports relative to the importing file, loads each module exactly once, and tolerates import cycles
+- **Declaration Order:** Irrelevant — types, functions, and globals may be used before they are declared, in any file
 - **Native Compilation:** Linux (ELF) and Windows 11 (PE `.exe`)
 - **Self-Update:** `b --update` re-downloads and rebuilds in place
 
-### Known Limitations
-- No generics yet
-- Enums are resolved to plain `int` at compile time (no type safety)
-- Import system prepared but not fully functional yet
-
 ### Planned
-- Full module/import system with dependency resolution
-- Generics
-- Distinct `enum` type with exhaustiveness checking
 - Dependent types (memory currently manual, C-style)
+- Type inference for generic call sites (today type arguments are explicit)
 - Self-hosting (B compiler written in B)
 
 ---
@@ -396,7 +399,7 @@ int main() {
 
 ```b
 int main() {
-    int* arr = malloc(5 * 4);  // allocate 5 ints (4 bytes each)
+    int* arr = malloc(5 * sizeof(int));  // allocate 5 ints
     
     arr[0] = 10;
     arr[1] = 20;
@@ -409,6 +412,45 @@ int main() {
     return 0;
 }
 ```
+
+`sizeof(T)` takes a type — a primitive, a struct, a pointer, or a generic
+instantiation — and yields its size in bytes as an `int`:
+
+```b
+struct Point {
+    int x;
+    int y;
+};
+
+int main() {
+    printf("%d %d %d\n", sizeof(int), sizeof(Point), sizeof(Point*));
+    return 0;
+}
+```
+
+#### Fixed-Size Arrays
+
+Local arrays live on the stack and behave like a pointer to their first element —
+no `malloc`, no `free`:
+
+```b
+int main() {
+    int numbers[5];
+    for (int i = 0; i < 5; i = i + 1) {
+        numbers[i] = i * i;
+    }
+    printf("%d\n", numbers[4]);  // 16
+    
+    char buffer[256];
+    scanf("%255s", buffer);
+    printf("You typed: %s\n", buffer);
+    
+    return 0;
+}
+```
+
+The size must be a positive integer literal, and a fixed-size array cannot have an
+initializer. For global buffers, use `malloc`.
 
 #### Character Literals and Escape Sequences
 
@@ -509,6 +551,63 @@ enum Status {
 };
 ```
 
+#### Enums Are Distinct Types
+
+An `enum` is its own type, not an alias for `int`. The compiler rejects anything
+that mixes an enum with a plain number or with a different enum:
+
+```b
+enum Color { RED, GREEN, BLUE };
+enum Fruit { APPLE, PEAR };
+
+int main() {
+    Color c = RED;      // fine
+    
+    // int n = RED;     // error: cannot use enum 'Color' for a variable of type 'int'
+    // Color d = APPLE; // error: cannot use enum 'Fruit' for a variable of enum type 'Color'
+    // c = 5;           // error: cannot assign a non-enum value to enum type 'Color'
+    // if (c == 0) {}   // error: cannot compare enum 'Color' with a non-enum value
+    // Color e = c + 1; // error: enum 'Color' supports only == and !=
+    
+    return 0;
+}
+```
+
+The same rules apply to function arguments, return values, and struct fields.
+Enums support `==` and `!=`; for anything else, cast explicitly:
+
+```b
+enum Color { RED, GREEN, BLUE };
+
+int main() {
+    Color c = BLUE;
+    
+    int raw = (int)c;         // enum  -> int
+    Color parsed = (Color)1;  // int   -> enum
+    
+    printf("%d %d\n", raw, (int)parsed);
+    return 0;
+}
+```
+
+A `switch` over an enum only accepts case labels of that enum, and warns at
+compile time when a case is missing and there is no `default`:
+
+```b
+enum Color { RED, GREEN, BLUE };
+
+void describe(Color c) {
+    switch (c) {          // Warning: does not handle BLUE and has no default case
+        case RED:
+            println("red");
+            break;
+        case GREEN:
+            println("green");
+            break;
+    }
+}
+```
+
 ### Level 4: Advanced Features
 
 #### String Operations
@@ -580,7 +679,8 @@ int main() {
     // Write to file
     FILE* f = fopen("output.txt", "w");
     if (f != 0) {
-        printf(f, "Hello, File!\n");
+        fprintf(f, "Hello, File!\n");
+        fprintf(f, "answer = %d\n", 42);
         fclose(f);
     }
     
@@ -588,8 +688,8 @@ int main() {
     f = fopen("output.txt", "r");
     if (f != 0) {
         char buffer[256];
-        fread(buffer, 1, 256, f);
-        printf("Read: %s\n", buffer);
+        fgets(buffer, 256, f);
+        printf("Read: %s", buffer);
         fclose(f);
     }
     
@@ -622,7 +722,7 @@ struct Node {
 };
 
 Node* createNode(int value) {
-    Node* n = malloc(8 + 8);  // int + pointer
+    Node* n = malloc(sizeof(Node));
     n->value = value;
     n->next = 0;
     return n;
@@ -648,6 +748,157 @@ int main() {
 }
 ```
 
+### Level 5: Generics
+
+#### Generic Functions
+
+Write the type parameters in angle brackets after the function name, then use
+them anywhere a type is expected:
+
+```b
+T maxOf<T>(T a, T b) {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+int main() {
+    printf("%d\n", maxOf<int>(3, 9));        // 9
+    printf("%f\n", maxOf<float>(1.5, 0.5));  // 1.500000
+    return 0;
+}
+```
+
+Type arguments are written explicitly at the call site: `maxOf<int>(3, 9)`.
+
+Each combination of type arguments is compiled into its own specialized native
+function (monomorphization), so a generic call costs exactly as much as the
+hand-written version — no boxing, no indirection, no runtime type information.
+
+#### Generic Structs
+
+```b
+struct Box<T> {
+    T value;
+};
+
+struct Pair<A, B> {
+    A first;
+    B second;
+};
+
+int main() {
+    Box<int> number;
+    number.value = 42;
+    
+    Pair<int, float> pair;
+    pair.first = 4;
+    pair.second = 0.25;
+    
+    printf("%d %d %f\n", number.value, pair.first, pair.second);
+    return 0;
+}
+```
+
+Generic structs and functions compose, including on the heap — `sizeof` knows the
+size of any instantiation:
+
+```b
+struct Stack<T> {
+    T* items;
+    int count;
+};
+
+Stack<T>* stackNew<T>(int capacity) {
+    Stack<T>* s = malloc(sizeof(Stack<T>));
+    s->items = malloc(capacity * sizeof(T));
+    s->count = 0;
+    return s;
+}
+
+void stackPush<T>(Stack<T>* s, T value) {
+    s->items[s->count] = value;
+    s->count = s->count + 1;
+}
+
+T stackTop<T>(Stack<T>* s) {
+    return s->items[s->count - 1];
+}
+
+int main() {
+    Stack<int>* numbers = stackNew<int>(16);
+    stackPush<int>(numbers, 11);
+    stackPush<int>(numbers, 22);
+    printf("top: %d of %d\n", stackTop<int>(numbers), numbers->count);
+    
+    free(numbers->items);
+    free(numbers);
+    return 0;
+}
+```
+
+A generic type argument can itself be a generic instantiation, a pointer, a
+struct, or an enum — for example `Pair<Box<int>*, int>`.
+
+### Level 6: Modules
+
+#### Splitting a Project Across Files
+
+`import` pulls another `.b` file into the compilation:
+
+```b
+import "geometry/vec.b";
+import "report.b";
+
+int main() {
+    Vec2* v = vecNew(2, 5);
+    report(HIGH, v);
+    free(v);
+    return 0;
+}
+```
+
+Compile the file that contains `main`; every imported module is found, compiled,
+and linked in one step:
+
+```bash
+b main.b
+./main
+```
+
+**How imports resolve**
+
+- Paths are relative to the **importing file**, so `import "geometry/vec.b";`
+  inside `main.b` refers to `geometry/vec.b` next to `main.b`. If that fails, the
+  path is retried relative to the current working directory.
+- The `.b` extension is optional: `import "geometry/vec";` works too.
+- Each module is compiled **exactly once**, no matter how many files import it,
+  so diamond-shaped dependency graphs need no include guards.
+- **Import cycles are allowed.** If `a.b` imports `b.b` and `b.b` imports `a.b`,
+  each is still loaded once and functions may call across the cycle freely.
+- `import` must appear at the top level of a file, not inside a function.
+
+**What modules share**
+
+Everything a module declares — functions, structs, enums, typedefs, globals, and
+generics — is visible to every other module in the program. There are no headers
+and no forward declarations, and **declaration order does not matter**: a
+function may call another function that is defined later or in a different file,
+and a struct may be used before the file that declares it is reached.
+
+```
+project/
+├── main.b                 // import "report.b";  import "geometry/vec.b";
+├── report.b               // import "geometry/vec.b";
+└── geometry/
+    ├── vec.b              // import "scalar.b";
+    └── scalar.b
+```
+
+Because names are global to the program, defining the same function, struct, or
+global twice is a compile error that names the duplicate.
+
 ---
 
 ## Operators and Precedence
@@ -655,7 +906,7 @@ int main() {
 | Operator | Type | Associativity |
 |----------|------|----------------|
 | `()` `[]` `.` `->` | Postfix | Left |
-| `!` `~` `*` `&` `-` (unary) | Unary | Right |
+| `!` `~` `*` `&` `-` (unary) `sizeof` `(type)` | Unary | Right |
 | `*` `/` `%` | Multiplicative | Left |
 | `+` `-` | Additive | Left |
 | `<<` `>>` | Bitwise Shift | Left |
@@ -694,10 +945,16 @@ powershell -ExecutionPolicy Bypass -File install.ps1  # Windows
 ## Project Structure
 
 ```
-Arc/
+B/
 ├── src/
 │   └── b_combined.cpp     # Entire compiler in one file
 ├── examples/              # Sample .b programs
+│   ├── hello.b
+│   ├── generics.b
+│   ├── enums.b
+│   ├── linked_list.b
+│   └── project/           # Multi-file project using imports
+├── docs/Architecture.md   # Compiler pipeline walkthrough
 ├── install.sh / get.sh    # Linux installer and bootstrap script
 ├── install.ps1 / get.ps1  # Windows installer and bootstrap script
 ├── CMakeLists.txt         # Windows build configuration
@@ -765,7 +1022,7 @@ int main() {
 
 ```b
 int main() {
-    int* arr = malloc(10 * 4);  // 10 integers
+    int* arr = malloc(10 * sizeof(int));  // 10 integers
     
     for (int i = 0; i < 10; i = i + 1) {
         arr[i] = i * i;
@@ -819,6 +1076,22 @@ int main() {
 **Q: "Compilation failed" with no clear error**
 - Check for missing semicolons and mismatched braces
 - Verify all variable declarations before use
+
+**Q: "Cannot find module '...' imported from ..."**
+- Import paths are relative to the file that contains the `import`, not to the
+  directory you run `b` from
+- Check the spelling; the `.b` extension is optional but the path is not
+
+**Q: "Duplicate definition of function ..."**
+- Two modules in the same program define the same name. Names are global across
+  all imported files — rename one, or move the shared definition into a module
+  both files import
+
+**Q: "Cannot use enum 'X' for ... of type 'int'"**
+- Enums are distinct types. Convert explicitly with `(int)value` or `(X)number`
+
+**Q: "Generic function 'f' needs type arguments"**
+- Type arguments are explicit: write `f<int>(x)`, not `f(x)`
 
 **Q: Memory leak errors**
 - Use `free()` for every `malloc()`

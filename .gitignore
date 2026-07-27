@@ -5,7 +5,7 @@ out/
 dist/
 
 # Compiled binaries
-arc
+b
 *.o
 *.obj
 *.a
@@ -47,4 +47,11 @@ simple
 add
 factorial
 test_param
+
+# Compiled examples
+examples/hello
+examples/generics
+examples/enums
+examples/linked_list
+examples/project/main
 

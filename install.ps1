@@ -92,12 +92,12 @@ if ($missing.Count -gt 0) {
 }
 
 Write-Host ""
-Write-Host "[2/3] Compiling Arc compiler..."
+Write-Host "[2/3] Compiling B compiler..."
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $SrcFile = Join-Path $ScriptDir "src\b_combined.cpp"
 $BuildDir = Join-Path $ScriptDir "build"
-$ArcBinary = Join-Path $BuildDir "b.exe"
+$BBinary = Join-Path $BuildDir "b.exe"
 
 if (-not (Test-Path $SrcFile)) {
     Write-Host "Error: Source file not found at $SrcFile"
@@ -123,7 +123,7 @@ $compileArgs = @(
     "-fexceptions",
     "-I`"$includeDir`"",
     "`"$SrcFile`"",
-    "-o", "`"$ArcBinary`"",
+    "-o", "`"$BBinary`"",
     "-L`"$libDir`""
 ) + ($llvmLibs | ForEach-Object { "`"$_`"" })
 
@@ -136,10 +136,10 @@ if ($process.ExitCode -ne 0) {
     exit 1
 }
 
-Write-Host "Compilation successful: $ArcBinary"
+Write-Host "Compilation successful: $BBinary"
 Write-Host ""
 
-Write-Host "[3/3] Installing Arc compiler..."
+Write-Host "[3/3] Installing B compiler..."
 
 $InstallDir = Join-Path $env:USERPROFILE ".b\bin"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
@@ -152,15 +152,15 @@ if (Test-Path $TargetExe) {
     try {
         Rename-Item -Path $TargetExe -NewName "b.exe.old" -Force -ErrorAction Stop
     } catch {
-        # Currently running as arc.exe (e.g. via arc --update); renaming it out
+        # Currently running as b.exe (e.g. via b --update); renaming it out
         # of the way still succeeds on NTFS even while the process is alive.
     }
 }
 
-Copy-Item -Force $ArcBinary $TargetExe
+Copy-Item -Force $BBinary $TargetExe
 Remove-Item -Force $BackupExe -ErrorAction SilentlyContinue
 
-Write-Host "B compiler installed to: $InstallDir\arc.exe"
+Write-Host "B compiler installed to: $InstallDir\b.exe"
 Write-Host ""
 
 $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
@@ -179,11 +179,11 @@ Write-Host "=========================================="
 Write-Host "Installation complete!"
 Write-Host "=========================================="
 Write-Host ""
-Write-Host "Test the Arc compiler:"
-Write-Host "     arc --version"
+Write-Host "Test the B compiler:"
+Write-Host "     b --version"
 Write-Host ""
-Write-Host "Compile an Arc file:"
-Write-Host "     arc examples\hello.b"
+Write-Host "Compile a B file:"
+Write-Host "     b examples\hello.b"
 Write-Host ""
 Write-Host "(PATH updated for this session. Open a new terminal to pick it up everywhere.)"
 

@@ -1,15 +1,17 @@
-# Arc Compiler Architecture
+# B Compiler Architecture
 
 ## Overview
 
-The Arc compiler is a multi-stage pipeline that transforms source code into executable machine code via LLVM.
+The B compiler is a multi-stage pipeline that transforms source code into executable machine code via LLVM.
 
 ```
-Source Code (.arc)
+Entry Source File (.b)
+      ↓
+  Module Loader (imports → one token stream)
       ↓
    Lexer (Tokenization)
       ↓
-   Parser (AST Generation)
+   Parser (AST Generation + monomorphization)
       ↓
   Semantic Analysis
       ↓
@@ -19,6 +21,28 @@ Source Code (.arc)
       ↓
  Machine Code / Executable
 ```
+
+> **Note on source layout:** the compiler that ships is the single translation
+> unit `src/b_combined.cpp`. The `src/lexer/`, `src/parser/`, `src/ast/`, and
+> `src/codegen/` paths referenced below describe the logical structure of that
+> file's namespaces (`b::lexer`, `b::parser`, `b::ast`, `b::codegen`).
+
+## Phase 0: Module Loader
+
+### Purpose
+Turns a multi-file project into the single token stream the parser consumes.
+
+Starting from the entry file, each `import "path";` is resolved relative to the
+importing file (falling back to the working directory, with an optional `.b`
+extension). Modules are loaded depth-first, so an imported module's tokens are
+emitted before those of the file that imports it. A canonical-path set guarantees
+each module is loaded exactly once, which makes diamond dependencies free and
+import cycles harmless. Every token is stamped with its originating file so later
+errors can name it.
+
+Because the parser and code generator both resolve declarations in name-keyed
+passes rather than in source order, the resulting order of modules never
+constrains what a program may reference.
 
 ## Phase 1: Lexer
 
@@ -71,24 +95,58 @@ Builds an Abstract Syntax Tree (AST) from the token stream.
 2. Unary: negation, logical NOT, bitwise NOT
 3. Multiplicative: `*`, `/`, `%`
 4. Additive: `+`, `-`
-5. Relational: `<`, `<=`, `>`, `>=`
-6. Equality: `==`, `!=`
-7. Bitwise AND: `&`
-8. Bitwise XOR: `^`
-9. Bitwise OR: `|`
-10. Logical AND: `&&`
-11. Logical OR: `||`
-12. Assignment: `=` (right-associative)
+5. Shift: `<<`, `>>`
+6. Relational: `<`, `<=`, `>`, `>=`
+7. Equality: `==`, `!=`
+8. Bitwise AND: `&`
+9. Bitwise XOR: `^`
+10. Bitwise OR: `|`
+11. Logical AND: `&&`
+12. Logical OR: `||`
+13. Assignment: `=` (right-associative)
 
 **Supported Constructs**:
 - Function declarations with parameters and return types
-- Variable declarations with optional initialization
+- Variable declarations with optional initialization, including fixed-size arrays
 - Expression statements
 - Block statements (compound statements)
 - If/else conditionals
 - For and while loops
+- Switch statements with fall-through
 - Return statements
 - Function calls with argument lists
+- `sizeof(type)`
+
+**Prescan Pass**
+
+Before the main descent, the parser sweeps the token stream once to register
+every `enum` (its name, constants, and their values) and every function-pointer
+`typedef`, and to lift generic declarations out of the stream into templates.
+This is what makes enum and typedef names usable before the line that declares
+them, in any module.
+
+**Generics by Monomorphization**
+
+A generic declaration such as `T maxOf<T>(T a, T b)` or `struct Box<T>` is stored
+as a template: the declaration's tokens with the `<...>` parameter list removed,
+plus the index of its name token. It is not type-checked or emitted on its own.
+
+Each use site — `maxOf<int>(...)` in an expression, `Box<int>` in a type
+position — mangles the type arguments into a concrete name (`maxOf__int`,
+`Box__int`) and enqueues an instantiation request; identical requests collapse to
+one. After the main parse, the queue is drained: for each request the template's
+tokens are copied with each type parameter replaced by the argument's tokens and
+the name token replaced by the mangled name, and the result is parsed as an
+ordinary declaration. Since instantiating a template can request further
+instantiations (a generic that uses another generic, or recurses), the loop runs
+until the queue is empty.
+
+The parser splits a `>>` token into two `>` when it closes nested type arguments,
+so `Box<Box<int>>` needs no whitespace.
+
+From code generation onward, nothing knows generics existed — only ordinary
+functions and structs with mangled names, which is why a generic call costs
+exactly what the hand-written equivalent costs.
 
 ### AST Node Hierarchy (`src/ast/`)
 
@@ -138,10 +196,10 @@ Transforms AST into LLVM Intermediate Representation (IR) and machine code.
 - Function declaration and definition
 - Control flow with basic blocks and branches
 - Scope management with stack-based scoping
-- Dual type tracking (Arc types and LLVM types) for opaque pointer compatibility
+- Dual type tracking (B types and LLVM types) for opaque pointer compatibility
 
 **Type System Mapping**:
-- Arc primitive types → LLVM types (int→i32, float→f32, double→f64, bool→i1, char→i8, void→void)
+- B primitive types → LLVM types (int→i32, float→f32, double→f64, bool→i1, char→i8, void→void)
 - Pointer types with proper element type tracking
 - Struct types with field layout
 - Function types for C ABI compliance
@@ -149,15 +207,61 @@ Transforms AST into LLVM Intermediate Representation (IR) and machine code.
 - Null pointer literal (0) handled for pointer comparisons
 
 **Built-in Functions**:
-- `printf` - formatted output (variadic)
+- `printf`, `scanf`, `sprintf` - formatted I/O (variadic)
 - `fopen`, `fclose` - file operations
-- `fread`, `fseek`, `ftell` - file I/O
+- `fread`, `fwrite`, `fprintf`, `fgets`, `fseek`, `ftell` - file I/O
 - `malloc`, `free` - memory allocation
+- `strlen`, `strcmp`, `strcpy`, `atoi` - string helpers
+
+`print`, `println`, and `itoa` are not external symbols: the code generator
+synthesizes them, deriving a `printf` format string from each argument's LLVM
+type.
+
+**Declaration Passes**
+
+`visit(Program*)` runs in name-keyed passes rather than source order, which is
+what frees a program from declaration order across an entire multi-module build:
+
+1. Enum tables are recorded for switch checking.
+2. Every struct is created as an *opaque* named `StructType`.
+3. Struct bodies are filled in, so a field may reference any struct regardless of
+   which was declared first.
+4. Function-pointer typedefs are resolved.
+5. Globals are emitted.
+6. Every function *prototype* is created.
+7. Function bodies are emitted.
+
+Splitting 6 from 7 is what lets any function call any other function, defined
+later in the file or in a module loaded afterwards. Duplicate structs, globals,
+and functions are detected in these passes and reported by name.
+
+**Semantic Checks**
+
+There is no separate semantic pass; checks run during generation, where scope and
+type information already live:
+
+- `inferType` computes the static B type of an expression (literals, variables,
+  fields, indexing, deref/address-of, casts, call results) and drives both
+  lvalue addressing and the enum rules.
+- Enum types are enforced on initialization, assignment, arguments, returns, and
+  comparisons; an enum never implicitly becomes an `int` or another enum.
+- `switch` over an enum rejects foreign case labels and warns when a constant is
+  unhandled and no `default` exists.
+- Call arity is checked against the declared parameter list.
+- Assignment to a `const` variable is rejected.
+
+**Addressing Model**
+
+`addressOf` computes the address of any lvalue expression recursively —
+identifiers (local or global), struct fields, array elements, and dereferences —
+returning both the pointer and the B type of the pointee. Assignment, `&`, `*`,
+field access, and indexing all route through it, so arbitrary chains such as
+`a->b[i].c` work uniformly on either side of an assignment.
 
 ### Example Code Generation
 
-Arc code:
-```arc
+B code:
+```b
 int add(int a, int b) {
     return a + b;
 }
@@ -227,7 +331,7 @@ Adds support for user-defined types and pointer operations.
 
 ### Example
 
-```arc
+```b
 struct Point {
     int x;
     int y;
@@ -263,7 +367,7 @@ Enables heap allocation and file system access for self-hosting capability.
 
 ### Example
 
-```arc
+```b
 int main() {
     int* buffer = malloc(100);
     buffer[0] = 42;
@@ -288,8 +392,8 @@ Uses LLVM C++ API to:
 
 ### Example IR Target
 
-For Arc code:
-```arc
+For B code:
+```b
 int add(int a, int b) {
     return a + b;
 }
@@ -306,8 +410,8 @@ define i32 @add(i32 %a, i32 %b) {
 ## Design Decisions
 
 ### No Header Files
-Arc eschews C++'s header/implementation split:
-- Type information is embedded in `.arc` files
+B eschews C++'s header/implementation split:
+- Type information is embedded in `.b` files
 - Parser reads full context in one pass
 - Simplifies bootstrapping
 
@@ -329,13 +433,14 @@ Arc eschews C++'s header/implementation split:
 ## Compiler Invocation
 
 ```bash
-arc input.arc          # Tokenize and report tokens (Phase 1)
-arc --parse input.arc  # Parse to AST (Phases 1-2)
-arc --check input.arc  # Full semantic check (Phases 1-3)
-arc input.arc -o out   # Compile to executable (Phases 1-4)
+b input.b              # Compile to a native executable
+b input.b --debug      # Same, plus the loaded module list and an AST dump
+b --version
+b --update             # Re-download and rebuild the compiler in place
 ```
 
-(Details to be finalized during Phase 2)
+The output executable is named after the source file's stem and is written next
+to the current working directory.
 
 ## Memory Model
 
@@ -352,7 +457,7 @@ Simple, C-style manual memory management.
 
 1. **Unit Tests**: Lexer tokenization, parser grammar
 2. **Integration Tests**: Full compilation pipeline
-3. **Regression Tests**: Real-world Arc programs
+3. **Regression Tests**: Real-world B programs
 4. **Performance Tests**: Compiler speed and output quality
 
 ## Future Optimizations

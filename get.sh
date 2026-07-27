@@ -155,7 +155,7 @@ if [ "$1" = "update" ]; then
     exit 0
 fi
 
-if [ -d "$REPO_DIR/.git" ] && [ -x "$BIN_DIR/arc" ]; then
+if [ -d "$REPO_DIR/.git" ] && [ -x "$BIN_DIR/b" ]; then
     echo "=========================================="
     echo "B ist bereits installiert."
     echo "=========================================="
