@@ -19,12 +19,12 @@ Write one file, run one command, get one binary. No headers. No build system. No
 
 **Linux / WSL:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ital87/Arc/1.0.0/get.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ital87/B/main/get.sh | bash
 ```
 
 **Windows 11 (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/ital87/Arc/1.0.0/get.ps1 | iex
+irm https://raw.githubusercontent.com/ital87/B/main/get.ps1 | iex
 ```
 
 ### Compile & Run
@@ -682,8 +682,8 @@ The installers handle everything automatically. On Linux, never requires `sudo` 
 ### Manual Build
 
 ```bash
-git clone https://github.com/ital87/Arc.git
-cd Arc
+git clone https://github.com/ital87/B.git
+cd B
 ./install.sh           # Linux/macOS
 # or
 powershell -ExecutionPolicy Bypass -File install.ps1  # Windows

@@ -6,8 +6,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$RepoUrl = "https://github.com/ital87/Arc.git"
-$RepoBranch = "1.0.0"
+$RepoUrl = "https://github.com/ital87/B.git"
+$RepoBranch = "main"
 $InstallRoot = Join-Path $env:USERPROFILE ".b"
 $RepoDir = Join-Path $InstallRoot "repo"
 $BinDir = Join-Path $InstallRoot "bin"

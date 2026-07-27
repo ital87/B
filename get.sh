@@ -7,13 +7,13 @@ case "$(uname -s)" in
         echo "Windows detected (running inside $(uname -s))."
         echo "Please use the native Windows one-liner instead (PowerShell):"
         echo
-        echo "     irm https://raw.githubusercontent.com/ital87/Arc/1.0.0/get.ps1 | iex"
+        echo "     irm https://raw.githubusercontent.com/ital87/B/main/get.ps1 | iex"
         exit 1
         ;;
 esac
 
-REPO_URL="https://github.com/ital87/Arc.git"
-REPO_BRANCH="1.0.0"
+REPO_URL="https://github.com/ital87/B.git"
+REPO_BRANCH="main"
 INSTALL_ROOT="$HOME/.b"
 REPO_DIR="$INSTALL_ROOT/repo"
 BIN_DIR="$INSTALL_ROOT/bin"
