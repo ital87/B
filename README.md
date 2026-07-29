@@ -1,6 +1,6 @@
 # B — Systems Programming Language
 
-B is a small, practical systems programming language compiled to native machine code via LLVM. It reads like C, compiles in milliseconds, and produces fast native binaries on Linux and Windows.
+B is a small systems programming language compiled to native machine code via LLVM. It reads like C, borrows Rust's memory model, and produces fast native binaries. **Linux on x86-64 only** — see [Platform Support](#platform-support).
 
 ```b
 int main() {
@@ -22,10 +22,7 @@ Write one file, run one command, get one binary. No headers. No build system. No
 curl -fsSL https://raw.githubusercontent.com/ital87/B/main/get.sh | bash
 ```
 
-**Windows 11 (PowerShell):**
-```powershell
-irm https://raw.githubusercontent.com/ital87/B/main/get.ps1 | iex
-```
+Windows is not supported at the moment; see [Platform Support](#platform-support).
 
 ### Compile & Run
 
@@ -49,28 +46,36 @@ b examples/project/main.b
 ### Implemented
 - **Lexer:** Full tokenizer with keywords, operators, string/char/int/float literals (with escape sequences), line/block comments
 - **Parser:** Recursive-descent with operator precedence
-- **Types:** `int`, `float`, `double`, `bool`, `char`, `string`, `void`, `enum`, function pointers (via `typedef`), pointers (`T*`), arrays (via pointer indexing)
+- **Types:** `int`, `float`, `double`, `bool`, `char`, `string`, `void`, `enum`, function pointers (via `typedef`), owned heap values (`own T`), borrows (`&T`, `&mut T`), optionals (`own T?`), fixed-size local arrays
 - **Functions:** Declarations, parameters, return values, recursion, function pointers as first-class values
 - **Generics:** Generic functions and structs (`T maxOf<T>(T a, T b)`, `struct Box<T>`), compiled by monomorphization — one specialized native function per type, zero runtime cost
 - **Control Flow:** `if`/`else`, `while`, `for`, `switch`/`case`/`default`, `break`, `continue` — any value is truthy-tested against zero
-- **Memory:** `malloc`, `free`, `sizeof(T)`, pointers (`&`, `*`, `arr[i]`), full pointer arithmetic, fixed-size local arrays (`int buf[64];`)
+- **Memory Safety:** Ownership with move semantics, `drop` functions run automatically (RAII), shared and mutable borrows with aliasing rules, lifetimes, and no null pointers
+- **Allocator:** B's own heap on top of `mmap`, not C's `malloc` — size-class free lists, no libc dependency for allocation
 - **Structs:** Declaration, nesting by value, field access (`p.x` and `p->x` both work), arbitrary chains (`a->b->c.d`)
 - **Global Variables:** Top-level `int x = 5;` with optional `const` keyword
 - **Const:** Local and global const variables with compile-time assignment blocking
-- **I/O:** `print()`, `println()` (auto-format), `printf()`, `scanf()`, file I/O (`fopen`, `fclose`, `fread`, `fwrite`, `fprintf`, `fgets`, `fseek`, `ftell`)
+- **Slices:** `own [T]`, `&[T]`, `&mut [T]`, `new [T](n)`, `len(s)`, indexing with bounds checks
+- **Sized Slices:** `[T; N]` carries the length in the type — `len` becomes a constant, in-range constant indices need no check, and a wrong length is a compile error
+- **Optimizer:** the LLVM O2 pipeline runs before object emission
+- **Standard Library:** `std/math.b`, `std/string.b`, `std/list.b`, `std/map.b`, `std/io.b` — written in B, no libc
+- **I/O:** `print()`, `println()` (auto-format), `printf()`, `scanf()`, plus `std::io` on raw syscalls
 - **Strings:** `strlen`, `strcmp`, `strcpy`, `atoi`, `itoa`
-- **Type Casting:** C-style `(type)expr` between numeric types, `char`, enums, and pointers
+- **Type Casting:** C-style `(type)expr` between numeric types, `char`, and enums
 - **Float/Double:** Full arithmetic and comparison with mixed int/float expressions
 - **Character Literals:** `'A'`, `'\n'`, `'\t'`, `'\0'`, etc. with escape sequences
 - **Enums:** Distinct types — an `enum` is not an `int`, mixing them is a compile error, and a `switch` over an enum warns about unhandled cases
-- **Switch Statements:** Full support for multiple cases, default, and fall-through
-- **Module System:** `import "path/to/file.b";` resolves imports relative to the importing file, loads each module exactly once, and tolerates import cycles
+- **Switch Statements:** Multiple cases, `default`, and real fall-through; labels must be distinct compile-time constants
+- **Short-Circuit Logic:** `&&` and `||` skip their right operand once the result is decided
+- **Module System:** `import "path/to/file.b";` resolves imports relative to the importing file, loads each module exactly once, and tolerates import cycles (reported with their full chain under `--debug`)
+- **Namespaces:** `namespace geometry { ... }`, nestable and reopenable across files, `namespace a::b { }` shorthand, qualified access (`geometry::Vec2`), `using namespace`, and `::name` for the global scope
 - **Declaration Order:** Irrelevant — types, functions, and globals may be used before they are declared, in any file
-- **Native Compilation:** Linux (ELF) and Windows 11 (PE `.exe`)
+- **Native Compilation:** Linux x86-64 (ELF)
 - **Self-Update:** `b --update` re-downloads and rebuilds in place
 
 ### Planned
-- Dependent types (memory currently manual, C-style)
+- Functions generic over a length (`sum<int N>(&[int; N])`); today a generic
+  function takes the unsized `&[T]`
 - Type inference for generic call sites (today type arguments are explicit)
 - Self-hosting (B compiler written in B)
 
@@ -98,10 +103,11 @@ int main() {
     bool flag = true;
     char c = 'A';
     string s = "Hello";
-    
-    println(x);      // 42
-    printf("%f\n", f);    // 3.140000
-    
+
+    println(x);
+    printf("%f\n", f);
+    printf("%d %c %s\n", (int)flag, c, s);
+
     return 0;
 }
 ```
@@ -112,7 +118,7 @@ int main() {
 - `double` — 64-bit floating point
 - `bool` — true/false
 - `char` — single character (8-bit ASCII)
-- `string` — text (alias for `char*`, pointer to characters)
+- `string` — text
 - `void` — no value (used for functions that return nothing)
 
 #### Functions
@@ -127,7 +133,7 @@ void greet(string name) {
 }
 
 int main() {
-    int sum = add(5, 3);
+    printf("%d\n", add(5, 3));
     greet("Alice");
     return 0;
 }
@@ -319,10 +325,11 @@ int main() {
 int main() {
     const int x = 10;
     // x = 20;  // Compile error!
-    
+
     int y = 5;
-    y = 15;  // OK
-    
+    y = 15;    // OK
+
+    printf("%d %d\n", x, y);
     return 0;
 }
 ```
@@ -334,16 +341,14 @@ int main() {
     float a = 3.5;
     float b = 2.0;
     
-    float sum = a + b;      // 5.5
-    float diff = a - b;     // 1.5
-    float prod = a * b;     // 7.0
-    float quot = a / b;     // 1.75
-    
-    printf("Sum: %f, Quotient: %f\n", sum, quot);
-    
+    printf("sum  %f\n", a + b);   // 5.5
+    printf("diff %f\n", a - b);   // 1.5
+    printf("prod %f\n", a * b);   // 7.0
+    printf("quot %f\n", a / b);   // 1.75
+
     double d = 3.14159;
-    printf("Double: %f\n", d);
-    
+    printf("double %f\n", d);
+
     return 0;
 }
 ```
@@ -379,42 +384,10 @@ int main() {
 }
 ```
 
-#### Pointers and Addresses
+#### Heap Values
 
-```b
-int main() {
-    int x = 42;
-    int* p = &x;      // p points to x
-    
-    int y = *p;       // y = 42 (dereference p)
-    
-    *p = 100;         // change x through p
-    printf("%d\n", x);  // 100
-    
-    return 0;
-}
-```
-
-#### Dynamic Memory
-
-```b
-int main() {
-    int* arr = malloc(5 * sizeof(int));  // allocate 5 ints
-    
-    arr[0] = 10;
-    arr[1] = 20;
-    arr[2] = 30;
-    
-    printf("arr[1] = %d\n", arr[1]);
-    
-    free(arr);  // deallocate
-    
-    return 0;
-}
-```
-
-`sizeof(T)` takes a type — a primitive, a struct, a pointer, or a generic
-instantiation — and yields its size in bytes as an `int`:
+B has no raw pointers and no `malloc`. A value on the heap is created with `new`
+and belongs to exactly one owner, written `own T`:
 
 ```b
 struct Point {
@@ -423,15 +396,34 @@ struct Point {
 };
 
 int main() {
-    printf("%d %d %d\n", sizeof(int), sizeof(Point), sizeof(Point*));
+    own Point p = new Point { x: 3, y: 4 };
+    printf("%d %d\n", p.x, p.y);
+    return 0;
+}
+```
+
+`new T { ... }` zero-fills the value and then assigns the fields you name, so
+anything you leave out starts at zero. The memory is released automatically when
+the owner goes out of scope — see [Memory Model](#memory-model).
+
+`sizeof(T)` takes a type — a primitive, a struct, or a generic instantiation —
+and yields its size in bytes as an `int`:
+
+```b
+struct Point {
+    int x;
+    int y;
+};
+
+int main() {
+    printf("%d %d\n", sizeof(int), sizeof(Point));
     return 0;
 }
 ```
 
 #### Fixed-Size Arrays
 
-Local arrays live on the stack and behave like a pointer to their first element —
-no `malloc`, no `free`:
+Local arrays live on the stack and are indexed directly:
 
 ```b
 int main() {
@@ -450,20 +442,20 @@ int main() {
 ```
 
 The size must be a positive integer literal, and a fixed-size array cannot have an
-initializer. For global buffers, use `malloc`.
+initializer. An array cannot be passed to a function or stored in a global — it
+does not outlive its block.
 
 #### Character Literals and Escape Sequences
 
 ```b
 int main() {
     char a = 'A';
-    char newline = '\n';
     char tab = '\t';
-    char null = '\0';
     char backslash = '\\';
-    
-    printf("Char: %c, ASCII: %d\n", a, a);  // A, 65
-    
+
+    printf("Char: %c, ASCII: %d\n", a, a);   // A, 65
+    printf("[%c]%c[%c]\n", tab, a, backslash);
+
     return 0;
 }
 ```
@@ -502,18 +494,15 @@ struct Point {
     int y;
 };
 
+void shift(&mut Point p) {
+    p.x = p.x + 1;
+    p.y = p.y + 1;
+}
+
 int main() {
-    Point p;
-    Point* ptr = &p;
-    
-    ptr->x = 5;      // arrow operator
-    ptr->y = 10;
-    
-    ptr.x = 5;       // dot operator also works
-    ptr.y = 10;
-    
-    printf("Point: (%d, %d)\n", ptr->x, ptr->y);
-    
+    own Point p = new Point { x: 5, y: 10 };
+    shift(&mut p);
+    printf("Point: (%d, %d)\n", p.x, p.y);
     return 0;
 }
 ```
@@ -562,7 +551,8 @@ enum Fruit { APPLE, PEAR };
 
 int main() {
     Color c = RED;      // fine
-    
+    printf("%d\n", (int)c);
+
     // int n = RED;     // error: cannot use enum 'Color' for a variable of type 'int'
     // Color d = APPLE; // error: cannot use enum 'Fruit' for a variable of enum type 'Color'
     // c = 5;           // error: cannot assign a non-enum value to enum type 'Color'
@@ -625,7 +615,7 @@ int main() {
         println("Strings are equal");
     }
     
-    string copy = malloc(100);
+    char copy[100];
     strcpy(copy, s);
     printf("Copy: %s\n", copy);
     
@@ -634,9 +624,6 @@ int main() {
     
     string str = itoa(n);
     printf("Back to string: %s\n", str);
-    
-    free(copy);
-    free(str);
     
     return 0;
 }
@@ -674,28 +661,9 @@ int main() {
 
 #### File I/O
 
-```b
-int main() {
-    // Write to file
-    FILE* f = fopen("output.txt", "w");
-    if (f != 0) {
-        fprintf(f, "Hello, File!\n");
-        fprintf(f, "answer = %d\n", 42);
-        fclose(f);
-    }
-    
-    // Read from file
-    f = fopen("output.txt", "r");
-    if (f != 0) {
-        char buffer[256];
-        fgets(buffer, 256, f);
-        printf("Read: %s", buffer);
-        fclose(f);
-    }
-    
-    return 0;
-}
-```
+File handling lives in `std/io.b` and is built on owned handles, so a reader
+closes its file when it goes out of scope. See
+[Standard Library](#standard-library).
 
 #### Recursion
 
@@ -718,32 +686,25 @@ int main() {
 ```b
 struct Node {
     int value;
-    Node* next;
+    own Node? next;
 };
 
-Node* createNode(int value) {
-    Node* n = malloc(sizeof(Node));
-    n->value = value;
-    n->next = 0;
-    return n;
-}
-
-void printList(Node* head) {
-    Node* current = head;
-    while (current != 0) {
-        printf("%d -> ", current->value);
-        current = current->next;
+void printList(&Node head) {
+    printf("%d -> ", head.value);
+    if some (rest = head.next) {
+        printList(rest);
+    } else {
+        println("end");
     }
-    println("null");
 }
 
 int main() {
-    Node* head = createNode(1);
-    head->next = createNode(2);
-    head->next->next = createNode(3);
-    
-    printList(head);
-    
+    own Node third = new Node { value: 3, next: none };
+    own Node second = new Node { value: 2, next: third };
+    own Node head = new Node { value: 1, next: second };
+
+    printList(&head);
+
     return 0;
 }
 ```
@@ -801,45 +762,31 @@ int main() {
 }
 ```
 
-Generic structs and functions compose, including on the heap — `sizeof` knows the
-size of any instantiation:
+Generic structs and functions compose, including on the heap:
 
 ```b
-struct Stack<T> {
-    T* items;
-    int count;
+struct Box<T> {
+    T value;
 };
 
-Stack<T>* stackNew<T>(int capacity) {
-    Stack<T>* s = malloc(sizeof(Stack<T>));
-    s->items = malloc(capacity * sizeof(T));
-    s->count = 0;
-    return s;
+own Box<T> boxNew<T>(T value) {
+    return new Box<T> { value: value };
 }
 
-void stackPush<T>(Stack<T>* s, T value) {
-    s->items[s->count] = value;
-    s->count = s->count + 1;
-}
-
-T stackTop<T>(Stack<T>* s) {
-    return s->items[s->count - 1];
+T unbox<T>(&Box<T> box) {
+    return box.value;
 }
 
 int main() {
-    Stack<int>* numbers = stackNew<int>(16);
-    stackPush<int>(numbers, 11);
-    stackPush<int>(numbers, 22);
-    printf("top: %d of %d\n", stackTop<int>(numbers), numbers->count);
-    
-    free(numbers->items);
-    free(numbers);
+    own Box<int> number = boxNew<int>(42);
+    own Box<string> text = boxNew<string>("boxed");
+    printf("%d %s\n", unbox<int>(&number), unbox<string>(&text));
     return 0;
 }
 ```
 
-A generic type argument can itself be a generic instantiation, a pointer, a
-struct, or an enum — for example `Pair<Box<int>*, int>`.
+A generic type argument can itself be a generic instantiation, an owned value, a
+struct, or an enum — for example `Pair<Box<int>, int>`.
 
 ### Level 6: Modules
 
@@ -852,9 +799,8 @@ import "geometry/vec.b";
 import "report.b";
 
 int main() {
-    Vec2* v = vecNew(2, 5);
-    report(HIGH, v);
-    free(v);
+    own Vec2 v = vecNew(2, 5);
+    report(HIGH, &v);
     return 0;
 }
 ```
@@ -876,7 +822,9 @@ b main.b
 - Each module is compiled **exactly once**, no matter how many files import it,
   so diamond-shaped dependency graphs need no include guards.
 - **Import cycles are allowed.** If `a.b` imports `b.b` and `b.b` imports `a.b`,
-  each is still loaded once and functions may call across the cycle freely.
+  each is still loaded once and functions may call across the cycle freely. The
+  compiler detects every cycle and prints the chain under `--debug`:
+  `Import cycle: a.b -> b.b -> a.b`.
 - `import` must appear at the top level of a file, not inside a function.
 
 **What modules share**
@@ -897,7 +845,475 @@ project/
 ```
 
 Because names are global to the program, defining the same function, struct, or
-global twice is a compile error that names the duplicate.
+global twice is a compile error that names the duplicate. To carve that global
+space up, use a namespace.
+
+#### Namespaces
+
+A `namespace` block groups declarations under a shared name. Members are reached
+from the outside with `::`:
+
+```b
+// geometry/vec.b
+namespace geometry {
+    const int SCALE = 3;
+
+    struct Vec2 {
+        int x;
+        int y;
+    };
+
+    own Vec2 make(int x, int y) {
+        return new Vec2 { x: x, y: y };
+    }
+}
+```
+
+```b
+// main.b
+import "geometry/vec.b";
+
+int main() {
+    own geometry::Vec2 v = geometry::make(2, 5);
+    printf("%d %d\n", v.x, geometry::SCALE);
+    return 0;
+}
+```
+
+Everything a namespace can contain is a member of it: functions, structs, enums
+(**and their constants**, so `report::LOW`), typedefs, globals, generic
+functions, and generic structs.
+
+**Nesting and reopening**
+
+Namespaces nest, and `namespace a::b { }` is shorthand for two nested blocks:
+
+```b
+namespace app::math {
+    int twice(int v) { return v * 2; }
+}
+```
+
+The same namespace may be **reopened** in any number of blocks and any number of
+files. Everything declared across all of them is one namespace:
+
+```b
+// tools.b
+import "app.b";
+
+namespace app::math {
+    int quad(int v) { return twice(twice(v)); }   // sees twice from the other file
+}
+```
+
+**How a name is looked up**
+
+An unqualified name is resolved in this order, stopping at the first match:
+
+1. the enclosing namespaces, innermost first — inside `geometry`, plain `SCALE`
+   is `geometry::SCALE`, and a nested `detail::clamp(...)` is enough;
+2. the global scope — so a global declaration always keeps its own meaning;
+3. namespaces made visible with `using namespace`.
+
+A qualified name like `app::math::quad` is looked up the same way: `app` is
+resolved against the enclosing namespaces, then the global scope, then any
+`using`. A leading `::` skips straight to the global scope, which is how you
+reach a global that a namespace member of the same name would otherwise hide:
+
+```b
+namespace codes { int add(int a, int b) { return a + b; } }
+int add(int a, int b) { return a + b + 1000; }
+
+int main() {
+    printf("%d\n", codes::add(3, 4));   // 7
+    printf("%d\n", ::add(3, 4));        // 1007
+    return 0;
+}
+```
+
+**`using namespace`**
+
+`using namespace X;` makes the members of `X` visible without qualification. It
+applies from that point to the end of the enclosing block, and **never leaves the
+file it is written in** — importing a module does not import its `using`
+declarations:
+
+```b
+import "geometry/vec.b";
+
+using namespace geometry;
+
+int main() {
+    own Vec2 v = make(2, 5);   // geometry::make
+    return 0;
+}
+```
+
+If two `using`-visible namespaces declare the same name, using it unqualified is
+an error that names both namespaces; qualify it to say which one you meant.
+
+**What namespaces do not change**
+
+Namespaces are resolved before the program is parsed: `geometry::Vec2` becomes
+the ordinary flat name `geometry__Vec2`. That means declaration order still does
+not matter, struct fields are untouched (`v->x` is a field, never a namespace
+member), and generics work inside namespaces exactly as outside. It also means a
+handwritten name like `geometry__Vec2` would collide with the namespace member —
+the compiler reports that instead of miscompiling it.
+
+---
+
+## Memory Model
+
+B has no garbage collector, no `malloc`, and no null pointers. Memory is managed
+by ownership, checked entirely at compile time, with no runtime cost beyond a
+one-bit flag where the compiler cannot decide statically.
+
+### Ownership
+
+A heap value is created with `new` and has exactly one owner:
+
+```b
+struct Vec2 { int x; int y; };
+
+own Vec2 a = new Vec2 { x: 1, y: 2 };
+```
+
+Handing that value to something else **moves** it. The old name is no longer
+usable:
+
+```b
+own Vec2 b = a;
+printf("%d\n", a.x);   // error: 'a' is used after it was moved
+```
+
+A move happens on initialization, assignment, passing to an `own` parameter, and
+returning. Assigning a fresh value to a moved-out name makes it usable again.
+
+The compiler follows control flow, so it also catches the cases where a move only
+happens on some paths:
+
+```b
+if (flag) { take(a); }
+use(a);                 // error: 'a' is used after it was moved
+
+for (int i = 0; i < 3; i = i + 1) {
+    take(a);            // error: moved inside a loop, the next round would move it again
+}
+```
+
+### Drop and RAII
+
+When an owner goes out of scope, its value is released. Give a struct a `drop`
+function to run cleanup first:
+
+```b
+struct Conn { int id; };
+
+drop Conn(&mut Conn self) {
+    printf("closing %d\n", self.id);
+}
+
+int main() {
+    own Conn c = new Conn { id: 1 };
+    return 0;
+}                       // prints "closing 1"
+```
+
+Drops run at the closing brace, on `return`, on `break` and on `continue`, in
+reverse declaration order. A value that was moved away is **not** dropped by the
+old owner — the new one is responsible. Owned fields are released with their
+owner, so a whole tree comes down in one go.
+
+Exactly one `drop` per struct, and it takes `&mut T`.
+
+### Borrowing
+
+Passing ownership is often more than you need. A borrow lends the value out:
+
+```b
+int  area(&Vec2 v)          { return v.x * v.y; }
+void grow(&mut Vec2 v)      { v.x = v.x + 1; }
+
+own Vec2 a = new Vec2 { x: 3, y: 4 };
+printf("%d\n", area(&a));
+grow(&mut a);
+```
+
+- `&T` is a **shared** borrow: read-only, any number at a time.
+- `&mut T` is a **unique** borrow: read/write, and while it exists nothing else
+  may touch the value — not another borrow, not the owner itself.
+
+A borrow lives until the end of the block that declared it. Put it in its own
+block to release it early:
+
+```b
+own Vec2 a = new Vec2 { x: 1, y: 2 };
+{
+    &Vec2 r = &a;
+    printf("%d\n", area(r));
+}
+own Vec2 b = a;         // fine: the borrow ended at the brace
+```
+
+A borrow can never outlive what it points at. Returning one to a local is
+rejected, and so is storing one in a longer-lived name.
+
+### No Null
+
+There is no null. When a value may be absent, mark the type with `?` and unwrap
+it before use:
+
+```b
+struct Node {
+    int value;
+    own Node? next;
+};
+
+int length(&Node n) {
+    if some (rest = n.next) {
+        return 1 + length(rest);
+    }
+    return 1;
+}
+
+own Node tail = new Node { value: 2, next: none };
+own Node head = new Node { value: 1, next: tail };
+```
+
+`if some (name = value)` binds `name` to the contents when there is one, and
+takes the `else` branch when there is not. `if some mut (...)` binds it mutably.
+
+Reaching through an optional without unwrapping is rejected:
+
+```b
+own V? maybe = none;
+printf("%d\n", maybe.x);
+// error: cannot reach 'x' through 'own V?' without unwrapping it first
+// help: write 'if some (value = maybe) { ... }' and use 'value' inside
+```
+
+That is the whole of it — there is no other route into an optional, so a null
+dereference cannot be written.
+
+### The Allocator
+
+`new` allocates from B's own heap, not from C. The runtime asks the kernel for
+memory with `mmap` and manages it with size-class free lists: blocks are rounded
+up to a power of two, carved out of 1 MiB chunks, and returned to a per-class
+free list on release. Requests above 1 MiB get their own mapping.
+
+A compiled B program has no undefined reference to `malloc` or `free` at all.
+
+---
+
+## Standard Library
+
+The library lives in `std/` and is written in B. Import what you need; paths are
+relative to the importing file.
+
+```b
+import "std/list.b";
+import "std/string.b";
+```
+
+### Slices
+
+Before the library, one piece of the language: a slice is a run of values with a
+length attached.
+
+```b
+own [int] numbers = new [int](6);   // owned, zero-filled
+numbers[2] = 7;
+printf("%d of %d\n", numbers[2], len(numbers));
+```
+
+`&[T]` lends a slice out for reading, `&mut [T]` for writing. Every index is
+checked; an out-of-range access aborts with a message rather than reading
+whatever is next in memory. A slice may hold owned handles too
+(`own [own Str]`), and dropping it drops every element.
+
+When the length is known at compile time, put it in the type and most of that
+checking disappears — see [Sized Slices](#sized-slices).
+
+### `std/math.b`
+
+`sqrt`, `sin`, `cos`, `tan`, `exp`, `ln`, `pow`, `powInt`, `hypot`, `floor`,
+`ceil`, `round`, `fmod`, `abs`, `min`, `max`, `clampInt`, plus `PI`, `E`, `TAU`.
+
+```b
+printf("%.10f\n", math::sqrt(2.0));     // 1.4142135624
+printf("%.10f\n", math::sin(math::PI / 6.0));  // 0.5000000000
+```
+
+Implemented in B — Newton's method for roots, range reduction with Taylor series
+for the trigonometric functions. No libm.
+
+### `std/string.b`
+
+`text::Str` is an owned, growable string.
+
+```b
+own text::Str greeting = text::fromLiteral("  Hello, World!  ");
+own text::Str trimmed = text::trim(&greeting);
+printf("%s\n", text::cstr(&trimmed));
+```
+
+`fromLiteral`, `fromInt`, `toInt`, `copy`, `length`, `charAt`, `cstr`, `equals`,
+`substring`, `concat`, `indexOf`, `indexOfChar`, `contains`, `startsWith`,
+`endsWith`, `toUpper`, `toLower`, `trim`, `replace`, `countChar`, `split`.
+
+`split` hands back `own [own text::Str]` — a slice that owns its pieces:
+
+```b
+own text::Str csv = text::fromLiteral("a,bb,ccc");
+own [own text::Str] parts = text::split(&csv, ',');
+for (int i = 0; i < len(parts); i = i + 1) {
+    printf("%s\n", text::cstr(parts[i]));
+}
+```
+
+### `std/list.b`
+
+`list::List<T>` is a growable array, generic over any element type.
+
+```b
+own list::List<int> xs = list::make<int>();
+list::push<int>(&mut xs, 42);
+printf("%d\n", list::get<int>(&xs, 0));
+```
+
+`make`, `withCapacity`, `size`, `capacity`, `isEmpty`, `reserve`, `push`, `get`,
+`set`, `pop`, `clear`, `contains`, `indexOf`, `removeAt`, `reverse`, `sort`.
+
+### `std/map.b`
+
+`map::Map<V>` is a hash map with `text::Str` keys, open addressing with linear
+probing, growing at three-quarters full.
+
+```b
+own map::Map<int> ages = map::make<int>();
+own text::Str alice = text::fromLiteral("alice");
+map::put<int>(&mut ages, &alice, 30);
+printf("%d\n", map::getOr<int>(&ages, &alice, 0 - 1));
+```
+
+`make`, `size`, `capacity`, `put`, `has`, `getOr`.
+
+### `std/io.b`
+
+Files and standard streams, on `read`/`write`/`open`/`close` syscalls.
+
+```b
+import "std/io.b";
+
+int main() {
+    own text::Str path = text::fromLiteral("input.txt");
+    if some mut (reader = io::openFile(&path)) {
+        while (true) {
+            if some (line = io::readLine(reader)) {
+                printf("%s\n", text::cstr(line));
+            } else {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+```
+
+`write`, `writeLine`, `writeError`, `stdin`, `fromHandle`, `openFile`,
+`readLine`, `readAll`, `readFile`, `writeFile`. A `Reader` buffers 8 KiB at a
+time and closes its handle in `drop`, so a reader that goes out of scope releases
+the file on its own.
+
+`examples/wordcount.b` puts strings, the map, the list and I/O together.
+`examples/calc.b` is a larger one: an expression interpreter with a lexer, a
+recursive-descent parser and a variable table, in about 250 lines.
+
+---
+
+## Sized Slices
+
+`[T; N]` is a slice whose length is part of its type. `N` must be known at
+compile time: an integer literal or a `const` global.
+
+```b
+const int SIZE = 8;
+
+own [int; SIZE] fixed = new [int](SIZE);
+```
+
+### What the length buys
+
+**`len` is a constant.** No runtime lookup at all:
+
+```b
+for (int i = 0; i < len(fixed); i = i + 1) {   // len(fixed) is literally 8
+    fixed[i] = i;
+}
+```
+
+**Constant indices are checked at compile time,** and then not at run time:
+
+```b
+own [int; 4] small = new [int](4);
+small[2] = 1;    // fine, no check emitted
+small[9] = 1;    // error: Index 9 is outside 'own [int; 4]'
+```
+
+**A wrong length does not compile:**
+
+```b
+int take(&[int; 4] values) { return values[0]; }
+
+own [int; 8] wrong = new [int](8);
+take(&wrong);    // error: expects '&[int; 4]' but got '&[int; 8]'
+```
+
+The element type is checked the same way, so `&[Vec2]` never reaches a `&[int]`
+parameter.
+
+### What it costs to give up
+
+A sized slice converts to an unsized one, losing the static length and getting
+runtime checks back:
+
+```b
+int sumAny(&[int] values) {            // works for any length
+    int total = 0;
+    for (int i = 0; i < len(values); i = i + 1) {
+        total = total + values[i];
+    }
+    return total;
+}
+
+own [int; 5] sized = new [int](5);
+sumAny(&sized);                        // fine
+```
+
+Write `&[T; N]` when the length is fixed and the code is hot; write `&[T]` when
+the function should work for any length.
+
+### The difference in the output
+
+Two functions, same body, one sized and one not:
+
+```b
+pub int sumFixed(&[int; 64] values) { ... }
+pub int sumAny(&[int] values)       { ... }
+```
+
+Compiled and disassembled, `sumFixed` is **7 instructions** and `sumAny` is
+**24**. The fixed length lets LLVM see the trip count, drop the bounds check, and
+vectorize the loop; the unsized version has to read the length and check each
+index. Both return the same answer.
+
+### Limits
+
+The length must be a constant, not a runtime value, and a function cannot yet be
+generic over it — there is no `sum<int N>(&[int; N])`. For code that must work at
+several lengths, take `&[T]`.
 
 ---
 
@@ -919,13 +1335,123 @@ global twice is a compile error that names the duplicate.
 | `\|\|` | Logical OR | Left |
 | `=` | Assignment | Right |
 
+`&&` and `\|\|` **short-circuit**: the right operand is not evaluated when the
+left one already decides the result, so `if (p != 0 && p->x == 1)` is safe on a
+null pointer.
+
+---
+
+## Language Rules
+
+These are the rules the compiler enforces. They are checked at compile time, so a
+program that violates one of them does not build.
+
+**Values and types**
+
+- `int` is 32-bit. An integer literal outside `-2147483648 .. 2147483647` is an
+  error rather than a silent wrap.
+- A floating literal is a `double`, exactly as in C. Assigning it to a `float`
+  narrows it at the assignment: `double d = 3.141592653589793;` keeps all its
+  digits.
+- `bool` converts to a number as `0` or `1`, never as `-1`.
+- A `char` printed with `print()` shows the character; use `(int)c` for its code.
+- Enums are distinct types: an enum never mixes with `int` without an explicit cast.
+
+**Names and scopes**
+
+- Every declared name must be used. A local that is never read, a parameter that
+  is ignored, a function or global nobody calls — all are errors. Prefix a name
+  with `_` to say the omission is deliberate, or mark a function or global `pub`
+  to make it part of a module's public surface. A value whose type has a `drop`
+  is exempt: holding it *is* its purpose.
+- A name declared in a block disappears at the closing brace.
+- A local **shadows** a global of the same name, for both reading and writing.
+- `const` is per declaration; a `const` local in one function does not constrain
+  a same-named variable in another.
+- Assigning to a `const` variable is an error.
+
+**Functions**
+
+- A non-`void` function must return a value on every path that can reach its
+  closing brace.
+- A call must pass exactly as many arguments as the function declares.
+- An argument is converted to the parameter type if that conversion is defined
+  (numeric widening or narrowing); otherwise it is an error.
+- Function pointers can be called through any expression that yields one, such as
+  a struct field or an array slot: `calc.run(3, 4)`, `handlers[i](x)`.
+
+**Memory**
+
+- There are no raw pointers and no null. See [Memory Model](#memory-model).
+- An `own` value has exactly one owner; using it after it was moved is an error.
+- A value may have many `&` borrows or one `&mut` borrow, never both at once.
+- A borrow may not outlive the value it points at.
+- An optional (`own T?`) must be unwrapped with `if some` before a field can be
+  read or an element indexed. There is no way to reach through one directly.
+- Indexing a slice is bounds-checked. With `[T; N]` the length is part of the
+  type, so constant indices are verified at compile time instead.
+- Locals are allocated once per call, not once per loop iteration, so declaring a
+  buffer inside a loop does not grow the stack.
+- A struct cannot contain itself by value, directly or through other structs.
+
+**Control flow**
+
+- A `switch` case falls through into the next one unless it ends with `break`.
+- Case labels must be compile-time constants and must all be distinct.
+- `switch` requires an integer, `char`, `bool` or enum value.
+- A `switch` over an enum only accepts labels of that enum, and warns about
+  unhandled constants when there is no `default`.
+
+**Constants**
+
+- Dividing by a literal zero is an error, not a crash at run time.
+- A global initializer must be a compile-time constant. It may use literals,
+  `sizeof`, enum constants, arithmetic on them, and previously declared `const`
+  globals — but not a function call.
+
+```b
+const int BASE = 7;
+int derived = BASE * 3;      // fine: BASE is const
+int fromCall = compute();    // error: not a compile-time constant
+```
+
+---
+
+## Platform Support
+
+B targets **Linux on x86-64** and nothing else right now.
+
+The reason is the runtime. B does not use C's allocator: `new` goes to B's own
+heap, which asks the kernel for memory with `mmap` through an inline `syscall`,
+and `std/io.b` reads and writes with `read`/`write`/`open`/`close` the same way.
+Those syscall numbers and that calling convention are Linux on x86-64.
+
+The compiler refuses to build for anything else rather than emitting programs
+that would fault on their first allocation. Porting means giving these seven
+runtime functions an implementation for the target:
+
+| Function | Linux today | Windows would need |
+|---|---|---|
+| `b_os_alloc` | `mmap` | `VirtualAlloc` |
+| `b_os_release` | `munmap` | `VirtualFree` |
+| `b_write` / `b_read` | `write` / `read` | `WriteFile` / `ReadFile` |
+| `b_open` / `b_close` | `open` / `close` | `CreateFileA` / `CloseHandle` |
+| `b_panic` | `write` + `exit_group` | `WriteFile` + `ExitProcess` |
+
+They live in one place — the LLVM IR string `kAllocatorRuntimeIR` in
+`src/b_combined.cpp` — so the port is contained, but it is real work and it is
+not done.
+
+Earlier versions of B ran on Windows because they used C's `malloc` and `stdio`.
+That went away with the move to an own allocator.
+
 ---
 
 ## Installation Details
 
 ### Requirements
 - LLVM 14+ (LLVM 22 supported)
-- C++17 compiler (GCC/Clang on Linux, Clang + MSVC linker on Windows)
+- C++17 compiler (GCC or Clang)
 - git
 
 The installers handle everything automatically. On Linux, never requires `sudo` for personal installation.
@@ -953,11 +1479,20 @@ B/
 │   ├── generics.b
 │   ├── enums.b
 │   ├── linked_list.b
-│   └── project/           # Multi-file project using imports
+│   ├── wordcount.b        # Uses the standard library end to end
+│   ├── calc.b             # Expression interpreter: lexer, parser, variables
+│   ├── project/           # Multi-file project using imports
+│   └── modules/           # Multi-file project using namespaces
+├── std/                   # Standard library, written in B
+│   ├── math.b
+│   ├── string.b
+│   ├── list.b
+│   ├── map.b
+│   └── io.b
+├── test/run_tests.sh      # End-to-end compiler test suite (114 cases)
 ├── docs/Architecture.md   # Compiler pipeline walkthrough
 ├── install.sh / get.sh    # Linux installer and bootstrap script
-├── install.ps1 / get.ps1  # Windows installer and bootstrap script
-├── CMakeLists.txt         # Windows build configuration
+├── CMakeLists.txt         # Alternative CMake build
 └── README.md              # This file
 ```
 
@@ -972,20 +1507,21 @@ The entire compiler lives in one file, compiled directly with `g++`/`clang++` an
    const int BUFFER_SIZE = 256;
    ```
 
-2. **Check pointer validity** — pointers can be null:
+2. **Use `own T?` when a value may be absent** — the compiler then forces you to
+   handle both cases:
    ```b
-   FILE* f = fopen("file.txt", "r");
-   if (f != 0) {
-       // use file
-       fclose(f);
+   if some (v = maybe) {
+       // v is present here
+   } else {
+       // nothing to work with
    }
    ```
 
-3. **Free allocated memory** — avoid leaks:
+3. **Let ownership free things for you** — an `own` value is released at the end
+   of its block, so leaks and double frees are not expressible:
    ```b
-   string s = malloc(100);
-   // use s
-   free(s);
+   own Buffer b = new Buffer { size: 100 };
+   // no free() needed
    ```
 
 4. **Use structs to organize data**:
@@ -1007,13 +1543,12 @@ The entire compiler lives in one file, compiled directly with `g++`/`clang++` an
 
 ```b
 int main() {
-    string name = malloc(100);
+    char name[100];
     printf("Enter your name: ");
     scanf("%99s", name);  // Limit input to prevent overflow
-    
+
     printf("Hello, %s!\n", name);
-    free(name);
-    
+
     return 0;
 }
 ```
@@ -1022,18 +1557,17 @@ int main() {
 
 ```b
 int main() {
-    int* arr = malloc(10 * sizeof(int));  // 10 integers
-    
+    int arr[10];
+
     for (int i = 0; i < 10; i = i + 1) {
         arr[i] = i * i;
     }
-    
+
     for (int i = 0; i < 10; i = i + 1) {
         printf("%d ", arr[i]);
     }
     println("");
-    
-    free(arr);
+
     return 0;
 }
 ```
@@ -1084,26 +1618,78 @@ int main() {
 
 **Q: "Duplicate definition of function ..."**
 - Two modules in the same program define the same name. Names are global across
-  all imported files — rename one, or move the shared definition into a module
-  both files import
+  all imported files — rename one, move the shared definition into a module both
+  files import, or put each definition in its own `namespace`
+
+**Q: "Unknown namespace 'X'"**
+- `X` is not a namespace that is visible here. Check the spelling, and remember
+  that a nested namespace needs its parent: `app::math`, not `math`, unless you
+  are already inside `app` or wrote `using namespace app;`
+
+**Q: "'name' is ambiguous: it is declared in ... and in ..."**
+- Two `using namespace` declarations make the same name visible. Qualify the use
+  (`one::f()`) to say which one you meant
+
+**Q: "'a::x' and 'a__x' both flatten to 'a__x'"**
+- A namespace member and a handwritten name collide after flattening. Rename
+  either one; `__` in an identifier is what a `::` becomes
 
 **Q: "Cannot use enum 'X' for ... of type 'int'"**
 - Enums are distinct types. Convert explicitly with `(int)value` or `(X)number`
 
+**Q: "Function 'f' must return a value on every path"**
+- Some route through `f` reaches the closing brace without a `return`. Add a
+  `return` at the end, or make the final `if` an `if`/`else` in which both arms
+  return
+
+**Q: "... must be a compile-time constant"**
+- A global initializer or a `case` label is being computed at run time. Move the
+  computation into a function, or declare the value it depends on as `const`
+
+**Q: "Undefined variable" for something declared just above**
+- The declaration is inside a block that has already closed. A name declared
+  between `{` and `}` does not outlive them
+
+**Q: "Integer literal ... does not fit in 'int'"**
+- `int` is 32-bit. Split the value, or keep it in a `double` if you only need
+  its magnitude
+
 **Q: "Generic function 'f' needs type arguments"**
 - Type arguments are explicit: write `f<int>(x)`, not `f(x)`
 
-**Q: Memory leak errors**
-- Use `free()` for every `malloc()`
-- Check that pointers are not null before dereferencing
+**Q: "'x' is used after it was moved"**
+- An `own` value has exactly one owner. Passing it to a function or assigning it
+  elsewhere hands it over. Borrow it with `&x` instead if the callee only needs
+  to look at it
+
+**Q: "cannot borrow 'x' mutably while it is borrowed"**
+- A value can have many `&` borrows or one `&mut`, never both. Put the earlier
+  borrow in its own block so it ends before the mutable one starts
+
+**Q: "'r' would outlive 'x'"**
+- The borrow lives longer than the value it points at. Move the value out to the
+  wider scope, or keep the borrow inside the narrower one
 
 **Q: Unexpected output from arithmetic**
 - Remember that integer division truncates: `5 / 2 = 2`
 - Use `float` or `double` for decimal arithmetic
 
+**Q: "cannot reach 'x' through 'own T?' without unwrapping it first"**
+- An optional may be empty, so B does not let you read through it. Wrap the
+  access in `if some (value = thing) { ... }`
+
+**Q: "'f' has no body"**
+- B has no forward declarations. Delete the prototype; a function may be called
+  before the line that defines it, in any file
+
+**Q: "Two string literals side by side are not joined"**
+- C's implicit concatenation does not exist in B. Write one literal, or build the
+  value with `text::concat`
+
 **Q: Segmentation fault**
-- Likely a null pointer dereference or buffer overflow
-- Check array bounds and pointer validity
+- Null dereferences are no longer possible, so the usual cause is an array index
+  outside its bounds. Bounds are not checked yet — that arrives with dependent
+  types
 
 ---
 

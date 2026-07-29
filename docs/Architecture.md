@@ -11,9 +11,11 @@ Entry Source File (.b)
       ↓
    Lexer (Tokenization)
       ↓
+ Namespace Resolver (namespaces → flat names)
+      ↓
    Parser (AST Generation + monomorphization)
       ↓
-  Semantic Analysis
+  Semantic Analysis (scopes, unused code, ownership, borrows)
       ↓
    Code Generation (LLVM IR)
       ↓
@@ -38,7 +40,12 @@ extension). Modules are loaded depth-first, so an imported module's tokens are
 emitted before those of the file that imports it. A canonical-path set guarantees
 each module is loaded exactly once, which makes diamond dependencies free and
 import cycles harmless. Every token is stamped with its originating file so later
-errors can name it.
+errors can name it, and each module's tokens stay contiguous in the stream.
+
+Alongside the canonical-path set the loader keeps the current import *stack*.
+Re-entering a file that is still on the stack is what a cycle is, so the loader
+records the chain from that file back to itself (`a.b -> b.b -> a.b`) before
+returning. Cycles remain legal; `--debug` prints every chain it found.
 
 Because the parser and code generator both resolve declarations in name-keyed
 passes rather than in source order, the resulting order of modules never
@@ -77,6 +84,81 @@ Lexer throws exceptions for:
 - Incomplete tokens
 
 Each exception includes line and column information for user-friendly error messages.
+
+## Phase 1.5: Namespace Resolver
+
+### Purpose
+Flattens `namespace` blocks away before the parser ever runs, so that neither the
+parser nor the code generator has to know namespaces exist.
+
+### Implementation (`b::modules::NamespaceResolver`)
+
+The resolver rewrites the token stream in place of a symbol table: a declaration
+inside `namespace geometry` is renamed to `geometry__Vec2`, and every reference
+to it — qualified or not — is renamed to match. `::` collapses into `__`, which
+is why the resolver also rejects a program in which a handwritten `geometry__Vec2`
+and a real `geometry::Vec2` would end up as the same name.
+
+A stream that contains no `namespace`, `using`, or `::` token is returned
+untouched, so programs that do not use namespaces take exactly the path they took
+before.
+
+**Pass 1 — collect.** Walks the stream tracking brace depth and a stack of open
+namespace blocks. At the declaration level of each namespace it recognises
+structs, enums (including their constants, which are namespace members in their
+own right), function-pointer typedefs, functions, and globals, and records the
+token index of every declared name together with its flattened spelling. A
+declaration's name is the last identifier before `(`, `=`, `;` or `[` that is not
+inside generic arguments, which is what makes `own Vec2 make(` and
+`Box<T> makeBox<T>(` both land on the right token. The same pass *freezes* the
+tokens that must never be renamed: struct field names, generic type parameters,
+and names declared at global scope.
+
+**Pass 2 — rewrite.** Walks the stream again, this time emitting tokens. The
+`namespace` headers and their closing braces are dropped as scaffolding, and each
+identifier is resolved: a recorded declaration site takes its flattened name, a
+frozen token is left alone, an identifier after `.` or `->` is a struct field and
+is left alone, an identifier followed by `::` starts a qualified path, and
+anything else is looked up through the enclosing namespaces, then the global
+scope, then the active `using namespace` declarations. Because modules arrive as
+contiguous runs of tokens, a `using` is discarded as soon as its block closes or
+its file ends — importing a module never imports its `using` declarations.
+
+Names that resolve nowhere are passed through unchanged; they are locals,
+parameters, or builtins, and the parser and code generator diagnose them as
+before.
+
+## Phase 1.75: Semantic Analysis
+
+### Purpose
+Resolves names against real scopes and enforces the rules the code generator has
+no good place to check. Everything it finds goes through the diagnostic engine,
+so one run reports every problem instead of stopping at the first.
+
+### Implementation (`b::sema::Analyzer`)
+
+A scope stack of locals, plus program-wide tables of globals, functions, structs
+and their field types. Each local records where it was declared, whether it has
+been read, whether it has been moved, and what borrows are outstanding against it.
+
+**Unused code.** Leaving a scope is where "declared but never read" is decided. A
+name starting with `_` opts out, and `pub` exempts a function or global from the
+rule so a library module can expose an API nobody in that build calls.
+
+**Moves.** An `own` value is consumed by an initializer, an assignment, an `own`
+parameter, an `own` return, and an owned field initializer in `new`. Tracking is
+flow-sensitive: `if`/`else` are analysed from a common snapshot and merged, a
+`switch` merges across all its cases, and a move inside a loop body is reported
+because the next iteration would move the same value again.
+
+**Borrows.** `&x` and `&mut x` check the target for conflicts at the point of the
+borrow. A borrow stored in a variable stays live until that variable's scope ends;
+a borrow used only as an argument lasts just for the call. Lifetimes are lexical:
+a borrow may not be stored in a scope outer to its target, and a borrow of a local
+may not be returned.
+
+The analyzer also stamps move sites onto the AST, which is how the code generator
+knows where to clear a drop flag without re-deriving the analysis.
 
 ## Phase 2: Parser
 
@@ -208,10 +290,46 @@ Transforms AST into LLVM Intermediate Representation (IR) and machine code.
 
 **Built-in Functions**:
 - `printf`, `scanf`, `sprintf` - formatted I/O (variadic)
-- `fopen`, `fclose` - file operations
-- `fread`, `fwrite`, `fprintf`, `fgets`, `fseek`, `ftell` - file I/O
-- `malloc`, `free` - memory allocation
 - `strlen`, `strcmp`, `strcpy`, `atoi` - string helpers
+
+Allocation is not among them. `b_alloc` and `b_free` come from B's own runtime,
+which the code generator links into every module.
+
+### Slices
+
+`own [T]` is a single pointer at run time; the element count lives in the second
+word of the allocator header, which is otherwise only used as a free-list link
+while the block is free. `b_alloc_array` writes it, `b_len` reads it back, and
+`b_bounds_check` compares an index against it before every `getelementptr`. An
+out-of-range access calls `b_panic`, which writes to file descriptor 2 and exits
+through `exit_group` — no libc involved.
+
+A slice whose elements are structs runs their drop glue one by one before the
+block is released; a slice of owned handles releases each non-null element.
+
+`[T; N]` carries its length in the type instead. `len` folds to a constant, a
+constant index is verified during code generation and emits no check at all, and
+the remaining checks compare against an immediate rather than a loaded value. The
+check itself is inline IR — an `icmp` and a branch into a cold block that calls
+`b_panic` — rather than a call, so LLVM's range analysis can remove it when it
+can prove the index is in bounds. Length and element type are compared at
+assignments, initializers and call sites; `[T; N]` converts to `[T]`, never the
+other way.
+
+### Allocator Runtime
+
+B does not use C's allocator. The code generator parses a small LLVM IR module and
+links it in, so every binary carries its own heap:
+
+- `b_os_alloc` / `b_os_release` issue `mmap` and `munmap` through inline `syscall`
+- `b_alloc` rounds a request up to a power of two of at least 32 bytes, takes the
+  matching size-class free list if it is non-empty, and otherwise carves the block
+  out of a 1 MiB chunk with a bump pointer; anything larger than a chunk gets its
+  own mapping
+- `b_free` pushes the block back onto its class list, reading the class out of the
+  16-byte header that `b_alloc` wrote
+
+A compiled B program has no undefined reference to `malloc` or `free`.
 
 `print`, `println`, and `itoa` are not external symbols: the code generator
 synthesizes them, deriving a `printf` format string from each argument's LLVM
@@ -306,6 +424,13 @@ The code generator handles automatic type conversions in several contexts:
 - Integer 0 is converted to null pointer when comparing with pointer types
 - Enables idioms like `if (file == 0)` for error checking
 
+### Optimization
+
+Before the module is written out, the code generator runs LLVM's standard O2
+pipeline over it. That is what promotes B's allocas to registers, inlines
+`b_alloc` into its callers, and folds the bounds checks that the sized-slice
+types made provable.
+
 ## Phase 4: Structs & Pointers
 
 ### Purpose
@@ -357,23 +482,21 @@ Enables heap allocation and file system access for self-hosting capability.
 - GEP-based index calculation
 
 **Memory Management**:
-- `malloc` function for dynamic allocation
-- `free` function for deallocation
-- Proper pointer type tracking through allocations
-
-**File I/O Declarations**:
-- Function signatures for file operations
-- C ABI compatibility for POSIX file functions
+- `new T { ... }` lowers to a `b_alloc` call, a zero fill, and one store per
+  named field
+- Owned locals carry a drop flag; scope exits, `return`, `break` and `continue`
+  emit a conditional release
+- `drop.glue.T` chains a struct's own `drop` with the release of its owned fields
 
 ### Example
 
 ```b
+struct Buffer { int first; int second; };
+
 int main() {
-    int* buffer = malloc(100);
-    buffer[0] = 42;
-    buffer[1] = buffer[0] + 8;
-    free(buffer);
-    return buffer[0];
+    own Buffer b = new Buffer { first: 42 };
+    b.second = b.first + 8;
+    return b.second;
 }
 ```
 
@@ -415,6 +538,28 @@ B eschews C++'s header/implementation split:
 - Parser reads full context in one pass
 - Simplifies bootstrapping
 
+### Ownership Instead of a Collector
+Memory is managed at compile time:
+- `own T` is a pointer at runtime, so all existing member-access and call
+  machinery works on it unchanged
+- Each owned local gets a one-bit drop flag in the entry block; it is cleared on
+  a move and tested at scope exit, which is what makes a conditional move correct
+  without any static case analysis in the backend
+- The compiler emits a `drop.glue.T` per struct that calls the user's `drop` and
+  then releases owned fields recursively
+- Optionals are nullable pointers with no extra tag, and `if some` compiles to a
+  null test — the type system is what makes the test unavoidable
+
+### Namespaces Resolved Before Parsing
+Namespaces are a naming concern, not a typing one, so they are settled in a
+token-level pass and never reach the AST:
+- The parser, the monomorphizer, and the code generator keep working on one flat
+  namespace, unchanged
+- Declaration order stays irrelevant, including across namespace blocks that are
+  reopened in different files
+- Generics inside a namespace need no special handling — a template and its
+  instantiations are simply renamed like everything else
+
 ### C-Style Syntax
 - Familiar to C/C++ programmers
 - Minimizes learning curve
@@ -434,7 +579,8 @@ B eschews C++'s header/implementation split:
 
 ```bash
 b input.b              # Compile to a native executable
-b input.b --debug      # Same, plus the loaded module list and an AST dump
+b input.b --debug      # Same, plus the module list, any import cycles,
+                       # the resolved namespaces, and an AST dump
 b --version
 b --update             # Re-download and rebuild the compiler in place
 ```

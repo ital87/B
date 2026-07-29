@@ -1,41 +1,43 @@
 struct Node {
     int value;
-    Node* next;
+    own Node? next;
 };
 
-Node* createNode(int value) {
-    Node* node = malloc(sizeof(Node));
-    node->value = value;
-    node->next = 0;
-    return node;
+drop Node(&mut Node self) {
+    printf("releasing %d\n", self.value);
 }
 
-void printList(Node* head) {
-    Node* current = head;
-    while (current != 0) {
-        printf("%d -> ", current->value);
-        current = current->next;
+void printList(&Node head) {
+    printf("%d -> ", head.value);
+    if some (rest = head.next) {
+        printList(rest);
+    } else {
+        println("end");
     }
-    println("null");
 }
 
-void freeList(Node* head) {
-    Node* current = head;
-    while (current != 0) {
-        Node* next = current->next;
-        free(current);
-        current = next;
+int length(&Node head) {
+    if some (rest = head.next) {
+        return 1 + length(rest);
     }
+    return 1;
+}
+
+int total(&Node head) {
+    int sum = head.value;
+    if some (rest = head.next) {
+        sum = sum + total(rest);
+    }
+    return sum;
 }
 
 int main() {
-    Node* head = createNode(1);
-    head->next = createNode(2);
-    head->next->next = createNode(3);
+    own Node third = new Node { value: 3, next: none };
+    own Node second = new Node { value: 2, next: third };
+    own Node head = new Node { value: 1, next: second };
 
-    printList(head);
-    printf("third value: %d\n", head->next->next->value);
+    printList(&head);
+    printf("length %d, total %d\n", length(&head), total(&head));
 
-    freeList(head);
     return 0;
 }

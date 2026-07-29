@@ -1,9 +1,9 @@
 {
-  "name": "arc-language",
-  "displayName": "Arc Language Support",
-  "description": "Syntax highlighting and language support for the Arc programming language",
-  "version": "0.1.0",
-  "publisher": "arc-project",
+  "name": "b-language",
+  "displayName": "B Language Support",
+  "description": "Syntax highlighting and language support for the B programming language",
+  "version": "0.2.0",
+  "publisher": "ital87",
   "license": "MIT",
   "engines": {
     "vscode": "^1.60.0"
@@ -14,35 +14,35 @@
   "contributes": {
     "languages": [
       {
-        "id": "arc",
+        "id": "b",
         "aliases": [
-          "Arc",
-          "arc"
+          "B",
+          "b"
         ],
         "extensions": [
-          ".arc"
+          ".b"
         ],
         "configuration": "./language-configuration.json"
       }
     ],
     "grammars": [
       {
-        "language": "arc",
-        "scopeName": "source.arc",
-        "path": "./syntaxes/arc.tmLanguage.json"
+        "language": "b",
+        "scopeName": "source.b",
+        "path": "./syntaxes/b.tmLanguage.json"
       }
     ]
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/ital87/arc.git"
+    "url": "https://github.com/ital87/B.git"
   },
   "keywords": [
-    "arc",
+    "b",
     "systems",
     "language",
     "compiled",
-    "llvm"
+    "llvm",
+    "ownership"
   ]
 }
-

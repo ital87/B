@@ -1,9 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(B LANGUAGES CXX)
-
-# This CMakeLists.txt exists for the Windows build path only (see install.ps1).
-# On Linux/macOS, install.sh compiles src/b_combined.cpp directly with
-# g++ and llvm-config, without CMake.
+project(B LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,24 +7,27 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(LLVM CONFIG REQUIRED)
 
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
-message(STATUS "LLVM Include dir: ${LLVM_INCLUDE_DIRS}")
-message(STATUS "LLVM Definitions: ${LLVM_DEFINITIONS}")
+message(STATUS "LLVM include dir: ${LLVM_INCLUDE_DIRS}")
 
 add_executable(b src/b_combined.cpp)
 
 target_include_directories(b PRIVATE ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(b PRIVATE ${LLVM_DEFINITIONS})
+target_compile_options(b PRIVATE -fexceptions)
 
-if(MSVC)
-    target_compile_options(b PRIVATE /EHsc)
+if(LLVM_LINK_LLVM_DYLIB OR TARGET LLVM)
+    message(STATUS "Linking against the LLVM shared library")
+    set(B_LLVM_LIBS LLVM)
 else()
-    target_compile_options(b PRIVATE -fexceptions)
+    message(STATUS "Linking against individual LLVM component libraries")
+    llvm_map_components_to_libnames(B_LLVM_LIBS
+        core support irreader asmparser linker passes
+        analysis instcombine scalaropts ipo transformutils
+        codegen target
+        x86asmparser x86codegen x86desc x86disassembler x86info asmprinter)
 endif()
 
-llvm_map_components_to_libnames(LLVM_LIBS core support irreader codegen target
-    x86asmparser x86codegen x86desc x86disassembler x86info asmprinter)
-
-target_link_libraries(b PRIVATE ${LLVM_LIBS})
+target_link_libraries(b PRIVATE ${B_LLVM_LIBS})
 
 install(TARGETS b RUNTIME DESTINATION bin)
-
+install(DIRECTORY std/ DESTINATION share/b/std FILES_MATCHING PATTERN "*.b")

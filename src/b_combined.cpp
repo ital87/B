@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <variant>
+#include <algorithm>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -27,6 +28,20 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/TargetSelect.h>
+#include <llvm/IR/MDBuilder.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Passes/OptimizationLevel.h>
+#include <llvm/Support/SourceMgr.h>
+#include <llvm/AsmParser/Parser.h>
+#include <llvm/Linker/Linker.h>
+
+#if !defined(__linux__) || !defined(__x86_64__)
+#error "B currently targets Linux on x86-64 only. Its runtime allocator and I/O \
+issue Linux syscalls directly, so a build for any other target would produce \
+programs that fault on the first allocation. Porting means giving b_os_alloc, \
+b_os_release, b_write, b_read, b_open, b_close and b_panic an implementation \
+for the target platform."
+#endif
 
 namespace fs = std::filesystem;
 
@@ -38,6 +53,142 @@ public:
         : std::runtime_error(message) {
     }
 };
+
+}
+
+namespace b::diag {
+
+enum class Severity {
+    Error,
+    Warning,
+    Note,
+};
+
+struct Message {
+    Severity severity = Severity::Error;
+    std::string file;
+    int line = 0;
+    int column = 0;
+    std::string text;
+    std::string help;
+};
+
+inline size_t editDistance(const std::string& a, const std::string& b) {
+    std::vector<size_t> previous(b.size() + 1);
+    std::vector<size_t> current(b.size() + 1);
+    for (size_t j = 0; j <= b.size(); ++j) {
+        previous[j] = j;
+    }
+    for (size_t i = 1; i <= a.size(); ++i) {
+        current[0] = i;
+        for (size_t j = 1; j <= b.size(); ++j) {
+            size_t substitution = previous[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1);
+            current[j] = std::min({previous[j] + 1, current[j - 1] + 1, substitution});
+        }
+        previous = current;
+    }
+    return previous[b.size()];
+}
+
+inline std::string closestMatch(const std::string& name, const std::vector<std::string>& candidates) {
+    std::string best;
+    size_t bestDistance = 0;
+    size_t limit = std::max<size_t>(1, name.size() / 3 + 1);
+    for (const auto& candidate : candidates) {
+        size_t distance = editDistance(name, candidate);
+        if (distance <= limit && (best.empty() || distance < bestDistance)) {
+            best = candidate;
+            bestDistance = distance;
+        }
+    }
+    return best;
+}
+
+class Reporter {
+public:
+    void report(Message message) {
+        if (message.severity == Severity::Error) {
+            ++errorCount;
+        } else if (message.severity == Severity::Warning) {
+            ++warningCount;
+        }
+        messages.push_back(std::move(message));
+    }
+
+    void error(const std::string& file, int line, int column, const std::string& text,
+               const std::string& help = "") {
+        report({Severity::Error, file, line, column, text, help});
+    }
+
+    void warning(const std::string& file, int line, int column, const std::string& text,
+                 const std::string& help = "") {
+        report({Severity::Warning, file, line, column, text, help});
+    }
+
+    bool failed() const { return errorCount > 0; }
+    size_t errors() const { return errorCount; }
+    size_t warnings() const { return warningCount; }
+    bool empty() const { return messages.empty(); }
+
+    void addSource(const std::string& file, const std::string& text) { sources[file] = text; }
+
+    void print(std::ostream& out) const;
+
+private:
+    std::vector<Message> messages;
+    std::unordered_map<std::string, std::string> sources;
+    size_t errorCount = 0;
+    size_t warningCount = 0;
+
+    std::string sourceLine(const std::string& file, int line) const;
+};
+
+std::string Reporter::sourceLine(const std::string& file, int line) const {
+    auto it = sources.find(file);
+    if (it == sources.end() || line <= 0) {
+        return "";
+    }
+    std::istringstream stream(it->second);
+    std::string text;
+    for (int i = 0; i < line && std::getline(stream, text); ++i) {
+        if (i == line - 1) {
+            return text;
+        }
+    }
+    return "";
+}
+
+void Reporter::print(std::ostream& out) const {
+    for (const auto& message : messages) {
+        const char* label = message.severity == Severity::Error     ? "error"
+                            : message.severity == Severity::Warning ? "warning"
+                                                                    : "note";
+        if (!message.file.empty() && message.line > 0) {
+            out << message.file << ":" << message.line << ":" << message.column << ": ";
+        }
+        out << label << ": " << message.text << "\n";
+
+        std::string source = sourceLine(message.file, message.line);
+        if (!source.empty()) {
+            std::string gutter = std::to_string(message.line);
+            out << "  " << gutter << " | " << source << "\n";
+            out << "  " << std::string(gutter.size(), ' ') << " | ";
+            for (int i = 1; i < message.column; ++i) {
+                out << (i - 1 < static_cast<int>(source.size()) && source[i - 1] == '\t' ? '\t' : ' ');
+            }
+            out << "^\n";
+        }
+        if (!message.help.empty()) {
+            out << "  help: " << message.help << "\n";
+        }
+        out << "\n";
+    }
+
+    if (errorCount > 0 || warningCount > 0) {
+        out << errorCount << " error" << (errorCount == 1 ? "" : "s") << ", " << warningCount
+            << " warning" << (warningCount == 1 ? "" : "s") << "\n";
+    }
+}
 
 }
 
@@ -71,6 +222,15 @@ enum class TokenType {
     KW_TRUE,
     KW_FALSE,
     KW_IMPORT,
+    KW_NAMESPACE,
+    KW_USING,
+    KW_PUB,
+    KW_OWN,
+    KW_NEW,
+    KW_DROP,
+    KW_MUT,
+    KW_SOME,
+    KW_NONE,
     KW_SWITCH,
     KW_CASE,
     KW_DEFAULT,
@@ -105,8 +265,10 @@ enum class TokenType {
     RBRACE,
     LBRACKET,
     RBRACKET,
+    QUESTION,
     SEMICOLON,
     COLON,
+    COLON_COLON,
     COMMA,
     DOT,
     ARROW,
@@ -165,6 +327,15 @@ std::string Token::typeToString() const {
         case TokenType::KW_TRUE:        return "KW_TRUE";
         case TokenType::KW_FALSE:       return "KW_FALSE";
         case TokenType::KW_IMPORT:      return "KW_IMPORT";
+        case TokenType::KW_NAMESPACE:   return "KW_NAMESPACE";
+        case TokenType::KW_USING:       return "KW_USING";
+        case TokenType::KW_PUB:         return "KW_PUB";
+        case TokenType::KW_OWN:         return "KW_OWN";
+        case TokenType::KW_NEW:         return "KW_NEW";
+        case TokenType::KW_DROP:        return "KW_DROP";
+        case TokenType::KW_MUT:         return "KW_MUT";
+        case TokenType::KW_SOME:        return "KW_SOME";
+        case TokenType::KW_NONE:        return "KW_NONE";
         case TokenType::KW_SWITCH:      return "KW_SWITCH";
         case TokenType::KW_CASE:        return "KW_CASE";
         case TokenType::KW_DEFAULT:     return "KW_DEFAULT";
@@ -200,7 +371,9 @@ std::string Token::typeToString() const {
         case TokenType::LBRACKET:       return "LBRACKET";
         case TokenType::RBRACKET:       return "RBRACKET";
         case TokenType::SEMICOLON:      return "SEMICOLON";
+        case TokenType::QUESTION:       return "QUESTION";
         case TokenType::COLON:          return "COLON";
+        case TokenType::COLON_COLON:    return "COLON_COLON";
         case TokenType::COMMA:          return "COMMA";
         case TokenType::DOT:            return "DOT";
         case TokenType::ARROW:          return "ARROW";
@@ -270,6 +443,15 @@ const std::unordered_map<std::string, TokenType> Lexer::keywords = {
     {"true", TokenType::KW_TRUE},
     {"false", TokenType::KW_FALSE},
     {"import", TokenType::KW_IMPORT},
+    {"namespace", TokenType::KW_NAMESPACE},
+    {"using", TokenType::KW_USING},
+    {"pub", TokenType::KW_PUB},
+    {"own", TokenType::KW_OWN},
+    {"new", TokenType::KW_NEW},
+    {"drop", TokenType::KW_DROP},
+    {"mut", TokenType::KW_MUT},
+    {"some", TokenType::KW_SOME},
+    {"none", TokenType::KW_NONE},
     {"switch", TokenType::KW_SWITCH},
     {"case", TokenType::KW_CASE},
     {"default", TokenType::KW_DEFAULT},
@@ -309,10 +491,18 @@ std::vector<Token> Lexer::tokenize() {
             case '[': tokens.push_back(makeToken(TokenType::LBRACKET, "[")); break;
             case ']': tokens.push_back(makeToken(TokenType::RBRACKET, "]")); break;
             case ';': tokens.push_back(makeToken(TokenType::SEMICOLON, ";")); break;
-            case ':': tokens.push_back(makeToken(TokenType::COLON, ":")); break;
+            case ':':
+                if (peek() == ':') {
+                    advance();
+                    tokens.push_back(makeToken(TokenType::COLON_COLON, "::"));
+                } else {
+                    tokens.push_back(makeToken(TokenType::COLON, ":"));
+                }
+                break;
             case ',': tokens.push_back(makeToken(TokenType::COMMA, ",")); break;
             case '.': tokens.push_back(makeToken(TokenType::DOT, ".")); break;
             case '~': tokens.push_back(makeToken(TokenType::TILDE, "~")); break;
+            case '?': tokens.push_back(makeToken(TokenType::QUESTION, "?")); break;
 
             case '+':
                 tokens.push_back(makeToken(TokenType::PLUS, "+"));
@@ -570,8 +760,18 @@ namespace b::ast {
 
 class ASTVisitor;
 
+struct SourceLocation {
+    std::string file;
+    int line = 0;
+    int column = 0;
+
+    bool known() const { return line > 0; }
+};
+
 class ASTNode {
 public:
+    SourceLocation loc;
+
     virtual ~ASTNode() = default;
     virtual void accept(ASTVisitor* visitor) = 0;
 };
@@ -585,13 +785,29 @@ enum class PrimitiveType {
     VOID,
 };
 
+enum class Ownership {
+    Value,
+    Owned,
+    SharedBorrow,
+    MutBorrow,
+};
+
 struct Type {
     PrimitiveType base;
     int pointerLevel = 0;
     std::string structName;
     std::string funcPointerTypedefName;
     std::string enumName;
+    Ownership ownership = Ownership::Value;
+    bool optional = false;
+    bool slice = false;
+    bool ownedElements = false;
+    int fixedLength = -1;
 
+    bool isOwned() const { return ownership == Ownership::Owned; }
+    bool isSharedBorrow() const { return ownership == Ownership::SharedBorrow; }
+    bool isMutBorrow() const { return ownership == Ownership::MutBorrow; }
+    bool isBorrow() const { return isSharedBorrow() || isMutBorrow(); }
     bool isVoid() const { return base == PrimitiveType::VOID && pointerLevel == 0; }
     bool isStruct() const { return !structName.empty(); }
     bool isFunctionPointer() const { return !funcPointerTypedefName.empty(); }
@@ -613,6 +829,7 @@ public:
 class Literal : public Expression {
 public:
     enum class Kind {
+        NONE,
         INTEGER,
         FLOAT,
         STRING,
@@ -625,6 +842,29 @@ public:
 
     Literal(Kind kind, const std::string& value, const std::string& enumName = "")
         : kind(kind), value(value), enumName(enumName) {}
+
+    void accept(ASTVisitor* visitor) override;
+};
+
+class NewSliceExpr : public Expression {
+public:
+    Type type;
+    std::unique_ptr<Expression> count;
+
+    NewSliceExpr(const Type& type, std::unique_ptr<Expression> count)
+        : type(type), count(std::move(count)) {}
+
+    void accept(ASTVisitor* visitor) override;
+};
+
+class NewExpr : public Expression {
+public:
+    Type type;
+    std::vector<std::pair<std::string, std::unique_ptr<Expression>>> fields;
+
+    NewExpr(const Type& type,
+            std::vector<std::pair<std::string, std::unique_ptr<Expression>>> fields)
+        : type(type), fields(std::move(fields)) {}
 
     void accept(ASTVisitor* visitor) override;
 };
@@ -642,6 +882,7 @@ public:
 class Identifier : public Expression {
 public:
     std::string name;
+    bool isMoveSource = false;
 
     explicit Identifier(const std::string& name)
         : name(name) {}
@@ -685,6 +926,7 @@ public:
 
 class UnaryOp : public Expression {
 public:
+    bool mutableBorrow = false;
     enum class Operator {
         NEGATE,
         NOT,
@@ -738,11 +980,19 @@ public:
 class FunctionCall : public Expression {
 public:
     std::string functionName;
+
+    std::unique_ptr<Expression> callee;
     std::vector<std::unique_ptr<Expression>> arguments;
 
     FunctionCall(const std::string& functionName,
                  std::vector<std::unique_ptr<Expression>> arguments)
         : functionName(functionName), arguments(std::move(arguments)) {}
+
+    FunctionCall(std::unique_ptr<Expression> callee,
+                 std::vector<std::unique_ptr<Expression>> arguments)
+        : callee(std::move(callee)), arguments(std::move(arguments)) {}
+
+    bool isIndirect() const { return callee != nullptr; }
 
     void accept(ASTVisitor* visitor) override;
 };
@@ -814,6 +1064,24 @@ public:
 
     explicit Block(std::vector<std::unique_ptr<Statement>> statements = {})
         : statements(std::move(statements)) {}
+
+    void accept(ASTVisitor* visitor) override;
+};
+
+class IfSomeStmt : public Statement {
+public:
+    std::string binding;
+    bool mutableBinding = false;
+    std::unique_ptr<Expression> source;
+    std::unique_ptr<Statement> thenBranch;
+    std::unique_ptr<Statement> elseBranch;
+
+    IfSomeStmt(const std::string& binding, bool mutableBinding,
+               std::unique_ptr<Expression> source,
+               std::unique_ptr<Statement> thenBranch,
+               std::unique_ptr<Statement> elseBranch)
+        : binding(binding), mutableBinding(mutableBinding), source(std::move(source)),
+          thenBranch(std::move(thenBranch)), elseBranch(std::move(elseBranch)) {}
 
     void accept(ASTVisitor* visitor) override;
 };
@@ -911,6 +1179,9 @@ public:
     std::vector<Parameter> parameters;
     std::unique_ptr<Block> body;
 
+    bool isPublic = false;
+    std::string dropsType;
+
     FunctionDecl(const Type& returnType,
                  const std::string& name,
                  std::vector<Parameter> parameters,
@@ -944,6 +1215,8 @@ struct GlobalVariable {
     std::string name;
     std::unique_ptr<Expression> initializer;
     bool isConst;
+    bool isPublic = false;
+    SourceLocation loc;
 
     GlobalVariable(const Type& type, const std::string& name,
                    std::unique_ptr<Expression> initializer,
@@ -978,6 +1251,8 @@ public:
 
     virtual void visit(Literal* node) = 0;
     virtual void visit(SizeofExpr* node) = 0;
+    virtual void visit(NewExpr* node) = 0;
+    virtual void visit(NewSliceExpr* node) = 0;
     virtual void visit(Identifier* node) = 0;
     virtual void visit(BinaryOp* node) = 0;
     virtual void visit(UnaryOp* node) = 0;
@@ -990,6 +1265,7 @@ public:
     virtual void visit(ExpressionStmt* node) = 0;
     virtual void visit(Block* node) = 0;
     virtual void visit(IfStmt* node) = 0;
+    virtual void visit(IfSomeStmt* node) = 0;
     virtual void visit(ForStmt* node) = 0;
     virtual void visit(WhileStmt* node) = 0;
     virtual void visit(BreakStmt* node) = 0;
@@ -1023,6 +1299,24 @@ std::string typeToString(const Type& type) {
         }
     }
 
+    if (type.slice) {
+        std::string inner = type.ownedElements ? "own " + name : name;
+        if (type.fixedLength >= 0) {
+            name = "[" + inner + "; " + std::to_string(type.fixedLength) + "]";
+        } else {
+            name = "[" + inner + "]";
+        }
+    }
+    std::string suffix = type.optional ? "?" : "";
+    if (type.isOwned()) {
+        return "own " + name + suffix;
+    }
+    if (type.isSharedBorrow()) {
+        return "&" + name + suffix;
+    }
+    if (type.isMutBorrow()) {
+        return "&mut " + name + suffix;
+    }
     for (int i = 0; i < type.pointerLevel; ++i) {
         name += "*";
     }
@@ -1030,6 +1324,14 @@ std::string typeToString(const Type& type) {
 }
 
 void Literal::accept(ASTVisitor* visitor) {
+    visitor->visit(this);
+}
+
+void NewExpr::accept(ASTVisitor* visitor) {
+    visitor->visit(this);
+}
+
+void NewSliceExpr::accept(ASTVisitor* visitor) {
     visitor->visit(this);
 }
 
@@ -1078,6 +1380,10 @@ void ExpressionStmt::accept(ASTVisitor* visitor) {
 }
 
 void Block::accept(ASTVisitor* visitor) {
+    visitor->visit(this);
+}
+
+void IfSomeStmt::accept(ASTVisitor* visitor) {
     visitor->visit(this);
 }
 
@@ -1157,6 +1463,7 @@ private:
     std::vector<b::ast::EnumDecl> enumDecls;
     std::unordered_set<std::string> funcPointerTypedefNames;
     std::unordered_set<std::string> constVariables;
+    std::unordered_map<std::string, int> constantLengths;
     std::unordered_map<std::string, GenericTemplate> genericStructs;
     std::unordered_map<std::string, GenericTemplate> genericFunctions;
     std::vector<PendingInstantiation> pendingInstantiations;
@@ -1192,10 +1499,12 @@ private:
     void parseEnumDecl();
     b::ast::FuncPointerTypedef parseTypedefDecl();
     std::unique_ptr<b::ast::FunctionDecl> parseFunctionDecl();
+    std::unique_ptr<b::ast::FunctionDecl> parseDropDecl();
     std::unique_ptr<b::ast::Statement> parseStatement();
     std::unique_ptr<b::ast::Statement> parseBlock();
     std::unique_ptr<b::ast::Statement> parseVariableDecl();
     std::unique_ptr<b::ast::Statement> parseIfStmt();
+    std::unique_ptr<b::ast::Statement> parseIfSomeStmt();
     std::unique_ptr<b::ast::Statement> parseForStmt();
     std::unique_ptr<b::ast::Statement> parseWhileStmt();
     std::unique_ptr<b::ast::Statement> parseReturnStmt();
@@ -1220,12 +1529,23 @@ private:
 
     std::vector<b::ast::Parameter> parseParameterList();
     b::ast::Type parseType();
+    int parseConstantLength();
+
+    b::ast::SourceLocation locationAt(size_t index) const;
+
+    template <typename T, typename... Args>
+    std::unique_ptr<T> makeNode(size_t startToken, Args&&... args) {
+        auto node = std::make_unique<T>(std::forward<Args>(args)...);
+        node->loc = locationAt(startToken);
+        return node;
+    }
 };
 
 Parser::Parser(const std::vector<b::lexer::Token>& tokens)
     : tokens(tokens), current(0) {}
 
 std::unique_ptr<b::ast::Program> Parser::parse() {
+    size_t nodeStart = current;
     std::vector<std::unique_ptr<b::ast::StructDecl>> structs;
     std::vector<std::unique_ptr<b::ast::FunctionDecl>> functions;
     std::vector<b::ast::FuncPointerTypedef> typedefs;
@@ -1235,46 +1555,71 @@ std::unique_ptr<b::ast::Program> Parser::parse() {
 
     while (!isAtEnd()) {
         if (check(b::lexer::TokenType::EOF_TOKEN)) break;
+        nodeStart = current;
         if (check(b::lexer::TokenType::KW_IMPORT)) {
             advance();
             consume(b::lexer::TokenType::STRING, "Expected module path after 'import'");
             consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after import");
-        } else if (check(b::lexer::TokenType::KW_STRUCT)) {
-            structs.push_back(parseStructDecl());
-        } else if (check(b::lexer::TokenType::KW_ENUM)) {
-            parseEnumDecl();
-        } else if (check(b::lexer::TokenType::KW_TYPEDEF)) {
-            typedefs.push_back(parseTypedefDecl());
-        } else if (check(b::lexer::TokenType::KW_CONST)) {
-            advance();
-            b::ast::Type type = parseType();
-            std::string name = consume(b::lexer::TokenType::IDENTIFIER, "Expected identifier" + location()).lexeme;
-            consume(b::lexer::TokenType::EQUAL, "Expected '=' in global const declaration" + location());
-            auto init = parseExpression();
-            consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after global const" + location());
-            globals.emplace_back(type, name, std::move(init), true);
-            constVariables.insert(name);
+        } else if (check(b::lexer::TokenType::KW_DROP)) {
+            functions.push_back(parseDropDecl());
         } else {
-            size_t saveTypePos = current;
-            b::ast::Type type = parseType();
-            if (!check(b::lexer::TokenType::IDENTIFIER)) {
-                throw ParseException("Expected name after type in top-level declaration" + location());
-            }
-            std::string name = advance().lexeme;
-            if (check(b::lexer::TokenType::LPAREN)) {
-                current = saveTypePos;
-                functions.push_back(parseFunctionDecl());
+
+            bool isPublic = match(b::lexer::TokenType::KW_PUB);
+
+            if (check(b::lexer::TokenType::KW_STRUCT)) {
+                structs.push_back(parseStructDecl());
+            } else if (check(b::lexer::TokenType::KW_ENUM)) {
+                parseEnumDecl();
+            } else if (check(b::lexer::TokenType::KW_TYPEDEF)) {
+                typedefs.push_back(parseTypedefDecl());
+            } else if (check(b::lexer::TokenType::KW_CONST)) {
+                advance();
+                b::ast::Type type = parseType();
+                std::string name = consume(b::lexer::TokenType::IDENTIFIER, "Expected identifier" + location()).lexeme;
+                consume(b::lexer::TokenType::EQUAL, "Expected '=' in global const declaration" + location());
+                auto init = parseExpression();
+                consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after global const" + location());
+                globals.emplace_back(type, name, std::move(init), true);
+                globals.back().isPublic = isPublic;
+                globals.back().loc = locationAt(nodeStart);
+                constVariables.insert(name);
+                if (auto* literal =
+                        dynamic_cast<b::ast::Literal*>(globals.back().initializer.get())) {
+                    if (literal->kind == b::ast::Literal::Kind::INTEGER) {
+                        try {
+                            long long value = std::stoll(literal->value);
+                            if (value >= 0 && value <= 2147483647LL) {
+                                constantLengths[name] = static_cast<int>(value);
+                            }
+                        } catch (const std::exception&) {
+                        }
+                    }
+                }
             } else {
-                if (check(b::lexer::TokenType::LBRACKET)) {
-                    throw ParseException("Fixed-size arrays are only supported for local variables; "
-                                         "allocate global buffers with malloc" + location());
+                size_t saveTypePos = current;
+                b::ast::Type type = parseType();
+                if (!check(b::lexer::TokenType::IDENTIFIER)) {
+                    throw ParseException("Expected name after type in top-level declaration" + location());
                 }
-                std::unique_ptr<b::ast::Expression> init = nullptr;
-                if (match(b::lexer::TokenType::EQUAL)) {
-                    init = parseExpression();
+                std::string name = advance().lexeme;
+                if (check(b::lexer::TokenType::LPAREN)) {
+                    current = saveTypePos;
+                    functions.push_back(parseFunctionDecl());
+                    functions.back()->isPublic = isPublic;
+                } else {
+                    if (check(b::lexer::TokenType::LBRACKET)) {
+                        throw ParseException("Fixed-size arrays are only supported for local variables; "
+                                             "allocate global buffers with malloc" + location());
+                    }
+                    std::unique_ptr<b::ast::Expression> init = nullptr;
+                    if (match(b::lexer::TokenType::EQUAL)) {
+                        init = parseExpression();
+                    }
+                    consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after global variable" + location());
+                    globals.emplace_back(type, name, std::move(init), false);
+                    globals.back().isPublic = isPublic;
+                    globals.back().loc = locationAt(nodeStart);
                 }
-                consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after global variable" + location());
-                globals.emplace_back(type, name, std::move(init), false);
             }
         }
     }
@@ -1306,9 +1651,19 @@ std::unique_ptr<b::ast::Program> Parser::parse() {
         current = savedCurrent;
     }
 
-    return std::make_unique<b::ast::Program>(std::move(structs), std::move(functions),
+    return makeNode<b::ast::Program>(nodeStart, std::move(structs), std::move(functions),
                                              std::move(typedefs), std::move(globals),
                                              std::move(enumDecls));
+}
+
+b::ast::SourceLocation Parser::locationAt(size_t index) const {
+    b::ast::SourceLocation where;
+    if (index < tokens.size()) {
+        where.file = tokens[index].file;
+        where.line = tokens[index].line;
+        where.column = tokens[index].column;
+    }
+    return where;
 }
 
 std::string Parser::location() const {
@@ -1355,12 +1710,17 @@ void Parser::prescanDeclarations() {
             scanTypedefName(i);
         }
 
-        if (depth == 0 && token.type == b::lexer::TokenType::KW_STRUCT &&
-            i + 2 < tokens.size() &&
-            tokens[i + 1].type == b::lexer::TokenType::IDENTIFIER &&
-            tokens[i + 2].type == b::lexer::TokenType::LESS) {
+        size_t structAt = i;
+        if (depth == 0 && token.type == b::lexer::TokenType::KW_PUB && i + 1 < tokens.size() &&
+            tokens[i + 1].type == b::lexer::TokenType::KW_STRUCT) {
+            structAt = i + 1;
+        }
+        if (depth == 0 && tokens[structAt].type == b::lexer::TokenType::KW_STRUCT &&
+            structAt + 2 < tokens.size() &&
+            tokens[structAt + 1].type == b::lexer::TokenType::IDENTIFIER &&
+            tokens[structAt + 2].type == b::lexer::TokenType::LESS) {
             size_t next = 0;
-            if (scanGenericTemplate(i, i + 1, true, next)) {
+            if (scanGenericTemplate(structAt, structAt + 1, true, next)) {
                 i = next;
                 declStartInFiltered = filtered.size();
                 declStartInSource = i;
@@ -1649,6 +2009,27 @@ std::vector<b::lexer::Token> Parser::typeToTokens(const b::ast::Type& type) cons
     b::lexer::TokenType baseType = b::lexer::TokenType::IDENTIFIER;
     std::string lexeme;
 
+    if (type.ownership == b::ast::Ownership::Owned) {
+        result.push_back(b::lexer::Token(b::lexer::TokenType::KW_OWN, "own", "own", 0, 0));
+        b::ast::Type bare = type;
+        bare.ownership = b::ast::Ownership::Value;
+        bare.optional = false;
+        bare.pointerLevel = 0;
+        for (auto& token : typeToTokens(bare)) {
+            result.push_back(token);
+        }
+        if (type.optional) {
+            result.push_back(b::lexer::Token(b::lexer::TokenType::QUESTION, "?", "?", 0, 0));
+        }
+        return result;
+    }
+
+    if (type.base == b::ast::PrimitiveType::CHAR && type.pointerLevel == 1 && !type.isStruct() &&
+        type.ownership == b::ast::Ownership::Value) {
+        result.push_back(b::lexer::Token(b::lexer::TokenType::KW_STRING, "string", "string", 0, 0));
+        return result;
+    }
+
     if (type.isFunctionPointer()) {
         lexeme = type.funcPointerTypedefName;
     } else if (!type.enumName.empty()) {
@@ -1675,8 +2056,8 @@ std::vector<b::lexer::Token> Parser::typeToTokens(const b::ast::Type& type) cons
     }
 
     result.push_back(b::lexer::Token(baseType, lexeme, lexeme, 0, 0));
-    for (int i = 0; i < type.pointerLevel; ++i) {
-        result.push_back(b::lexer::Token(b::lexer::TokenType::STAR, "*", "*", 0, 0));
+    if (type.pointerLevel > 0) {
+        throw ParseException("Cannot use a raw pointer type as a generic argument");
     }
     return result;
 }
@@ -1821,9 +2202,72 @@ bool Parser::isAtEnd() const {
     return peek().type == b::lexer::TokenType::EOF_TOKEN;
 }
 
+int Parser::parseConstantLength() {
+    if (check(b::lexer::TokenType::INTEGER)) {
+        long long value = 0;
+        try {
+            value = std::stoll(advance().value);
+        } catch (const std::exception&) {
+            throw ParseException("That is not a valid slice length" + location());
+        }
+        if (value < 0 || value > 2147483647LL) {
+            throw ParseException("A slice length must fit in 'int' and cannot be negative" +
+                                 location());
+        }
+        return static_cast<int>(value);
+    }
+    if (check(b::lexer::TokenType::IDENTIFIER)) {
+        std::string name = peek().lexeme;
+        auto known = constantLengths.find(name);
+        if (known != constantLengths.end()) {
+            advance();
+            return known->second;
+        }
+        throw ParseException("'" + name +
+                             "' is not a compile-time constant, so it cannot be a slice length" +
+                             location());
+    }
+    throw ParseException("Expected a constant length after ';'" + location());
+}
+
 b::ast::Type Parser::parseType() {
     b::ast::Type type;
     type.pointerLevel = 0;
+
+    bool owning = match(b::lexer::TokenType::KW_OWN);
+    bool borrowing = false;
+    bool borrowingMutably = false;
+    if (!owning && match(b::lexer::TokenType::AMPERSAND)) {
+        borrowing = true;
+        borrowingMutably = match(b::lexer::TokenType::KW_MUT);
+    }
+
+    if ((owning || borrowing) && match(b::lexer::TokenType::LBRACKET)) {
+        b::ast::Type element = parseType();
+        int declaredLength = -1;
+        if (match(b::lexer::TokenType::SEMICOLON)) {
+            declaredLength = parseConstantLength();
+        }
+        consume(b::lexer::TokenType::RBRACKET, "Expected ']' after the element type" + location());
+        if (element.slice || element.isBorrow()) {
+            throw ParseException("A slice holds values or owned handles, not '" +
+                                 b::ast::typeToString(element) + "'" + location());
+        }
+        bool holdsOwned = element.isOwned();
+        element.slice = true;
+        element.ownedElements = holdsOwned;
+        element.fixedLength = declaredLength;
+        element.pointerLevel = 1;
+        element.ownership = b::ast::Ownership::Value;
+        element.optional = false;
+        element.ownership = owning ? b::ast::Ownership::Owned
+                                   : (borrowingMutably ? b::ast::Ownership::MutBorrow
+                                                       : b::ast::Ownership::SharedBorrow);
+        if (match(b::lexer::TokenType::QUESTION)) {
+            element.optional = true;
+        }
+        return element;
+    }
 
     if (match(b::lexer::TokenType::KW_INT)) {
         type.base = b::ast::PrimitiveType::INT;
@@ -1867,8 +2311,41 @@ b::ast::Type Parser::parseType() {
         throw ParseException("Expected type, got '" + peek().lexeme + "'" + location());
     }
 
-    while (match(b::lexer::TokenType::STAR)) {
+    if (check(b::lexer::TokenType::STAR)) {
+        throw ParseException("Raw pointers were removed from B; write 'own " +
+                             b::ast::typeToString(type) + "' to own a value, '&" +
+                             b::ast::typeToString(type) + "' to borrow it, or add '?' to allow none" +
+                             location());
+    }
+
+    if (owning) {
+        if (type.pointerLevel != 0) {
+            throw ParseException("'own' already denotes a handle, so it cannot be combined with '*'" +
+                                 location());
+        }
+        if (!type.isStruct()) {
+            throw ParseException("'own' applies to struct types, not to '" +
+                                 b::ast::typeToString(type) + "'" + location());
+        }
+        type.ownership = b::ast::Ownership::Owned;
+        type.pointerLevel = 1;
+    }
+
+    if (borrowing) {
+        if (type.isVoid()) {
+            throw ParseException("There is nothing to borrow in 'void'" + location());
+        }
+        type.ownership = borrowingMutably ? b::ast::Ownership::MutBorrow
+                                          : b::ast::Ownership::SharedBorrow;
         type.pointerLevel++;
+    }
+
+    if (match(b::lexer::TokenType::QUESTION)) {
+        if (type.ownership == b::ast::Ownership::Value) {
+            throw ParseException("'?' applies to 'own' and borrow types, not to '" +
+                                 b::ast::typeToString(type) + "'" + location());
+        }
+        type.optional = true;
     }
 
     return type;
@@ -1889,6 +2366,8 @@ std::vector<b::ast::Parameter> Parser::parseParameterList() {
 }
 
 std::unique_ptr<b::ast::StructDecl> Parser::parseStructDecl() {
+    size_t nodeStart = current;
+    match(b::lexer::TokenType::KW_PUB);
     consume(b::lexer::TokenType::KW_STRUCT, "Expected 'struct'");
     std::string structName = consume(b::lexer::TokenType::IDENTIFIER, "Expected struct name").lexeme;
     consume(b::lexer::TokenType::LBRACE, "Expected '{' after struct name");
@@ -1904,7 +2383,7 @@ std::unique_ptr<b::ast::StructDecl> Parser::parseStructDecl() {
     consume(b::lexer::TokenType::RBRACE, "Expected '}' after struct body");
     consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after struct declaration");
 
-    return std::make_unique<b::ast::StructDecl>(structName, std::move(fields));
+    return makeNode<b::ast::StructDecl>(nodeStart, structName, std::move(fields));
 }
 
 void Parser::parseEnumDecl() {
@@ -1949,6 +2428,8 @@ b::ast::FuncPointerTypedef Parser::parseTypedefDecl() {
 }
 
 std::unique_ptr<b::ast::FunctionDecl> Parser::parseFunctionDecl() {
+    size_t nodeStart = current;
+    bool isPublic = match(b::lexer::TokenType::KW_PUB);
     b::ast::Type returnType = parseType();
     std::string functionName = consume(b::lexer::TokenType::IDENTIFIER, "Expected function name").lexeme;
 
@@ -1956,18 +2437,73 @@ std::unique_ptr<b::ast::FunctionDecl> Parser::parseFunctionDecl() {
     auto parameters = parseParameterList();
     consume(b::lexer::TokenType::RPAREN, "Expected ')' after parameters");
 
-    consume(b::lexer::TokenType::LBRACE, "Expected '{' before function body");
+    if (check(b::lexer::TokenType::SEMICOLON)) {
+        throw ParseException("'" + functionName +
+                             "' has no body. B needs no forward declarations: a function may be "
+                             "called before the line that defines it, in any file" + location());
+    }
+    consume(b::lexer::TokenType::LBRACE, "Expected '{' before the body of '" + functionName + "'" +
+                                             location());
     auto body = std::unique_ptr<b::ast::Block>(
         dynamic_cast<b::ast::Block*>(parseBlock().release())
     );
     consume(b::lexer::TokenType::RBRACE, "Expected '}' after function body");
 
-    return std::make_unique<b::ast::FunctionDecl>(
+    auto decl = makeNode<b::ast::FunctionDecl>(nodeStart,
         returnType, functionName, std::move(parameters), std::move(body)
     );
+    decl->isPublic = isPublic;
+    return decl;
+}
+
+std::unique_ptr<b::ast::FunctionDecl> Parser::parseDropDecl() {
+    size_t nodeStart = current;
+    consume(b::lexer::TokenType::KW_DROP, "Expected 'drop'");
+    std::string typeName = consume(b::lexer::TokenType::IDENTIFIER,
+                                   "Expected a struct name after 'drop'" + location()).lexeme;
+
+    consume(b::lexer::TokenType::LPAREN, "Expected '(' after 'drop " + typeName + "'" + location());
+    auto parameters = parseParameterList();
+    consume(b::lexer::TokenType::RPAREN, "Expected ')' after the drop parameter" + location());
+
+    if (parameters.size() != 1) {
+        throw ParseException("'drop " + typeName + "' takes exactly one parameter, the value being dropped" +
+                             location());
+    }
+    if (parameters[0].type.structName != typeName || !parameters[0].type.isMutBorrow() ||
+        parameters[0].type.optional) {
+        throw ParseException("'drop " + typeName + "' must take a '&mut " + typeName + "'" +
+                             location());
+    }
+
+    consume(b::lexer::TokenType::LBRACE, "Expected '{' before the drop body" + location());
+    auto body = std::unique_ptr<b::ast::Block>(
+        dynamic_cast<b::ast::Block*>(parseBlock().release()));
+    consume(b::lexer::TokenType::RBRACE, "Expected '}' after the drop body" + location());
+
+    b::ast::Type returnType;
+    returnType.base = b::ast::PrimitiveType::VOID;
+
+    auto decl = makeNode<b::ast::FunctionDecl>(nodeStart, returnType, "drop$" + typeName,
+                                               std::move(parameters), std::move(body));
+    decl->dropsType = typeName;
+    return decl;
 }
 
 bool Parser::looksLikeDeclarationStart() const {
+    if (check(b::lexer::TokenType::KW_OWN)) {
+        return true;
+    }
+    if (check(b::lexer::TokenType::AMPERSAND)) {
+        size_t probe = current + 1;
+        if (probe < tokens.size() && tokens[probe].type == b::lexer::TokenType::KW_MUT) {
+            ++probe;
+        }
+        if (probe + 1 < tokens.size() &&
+            tokens[probe + 1].type == b::lexer::TokenType::IDENTIFIER) {
+            return true;
+        }
+    }
     if (check(b::lexer::TokenType::KW_INT) ||
         check(b::lexer::TokenType::KW_FLOAT) ||
         check(b::lexer::TokenType::KW_DOUBLE) ||
@@ -2003,6 +2539,7 @@ bool Parser::looksLikeDeclarationStart() const {
 }
 
 std::unique_ptr<b::ast::Statement> Parser::parseStatement() {
+    size_t nodeStart = current;
     if (match(b::lexer::TokenType::LBRACE)) {
         auto block = parseBlock();
         consume(b::lexer::TokenType::RBRACE, "Expected '}' after block");
@@ -2014,7 +2551,8 @@ std::unique_ptr<b::ast::Statement> Parser::parseStatement() {
         check(b::lexer::TokenType::KW_BOOL) ||
         check(b::lexer::TokenType::KW_CHAR) ||
         check(b::lexer::TokenType::KW_STRING) ||
-        check(b::lexer::TokenType::KW_VOID)) {
+        check(b::lexer::TokenType::KW_VOID) ||
+        check(b::lexer::TokenType::KW_OWN)) {
         return parseVariableDecl();
     }
     if (check(b::lexer::TokenType::KW_CONST)) {
@@ -2025,10 +2563,15 @@ std::unique_ptr<b::ast::Statement> Parser::parseStatement() {
         auto init = parseExpression();
         consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after const");
         constVariables.insert(name);
-        return std::make_unique<b::ast::VariableDecl>(type, name, std::move(init), true);
+        return makeNode<b::ast::VariableDecl>(nodeStart, type, name, std::move(init), true);
     }
-    if (check(b::lexer::TokenType::IDENTIFIER) && looksLikeDeclarationStart()) {
+    if ((check(b::lexer::TokenType::IDENTIFIER) || check(b::lexer::TokenType::AMPERSAND)) &&
+        looksLikeDeclarationStart()) {
         return parseVariableDecl();
+    }
+    if (check(b::lexer::TokenType::KW_IF) && current + 1 < tokens.size() &&
+        tokens[current + 1].type == b::lexer::TokenType::KW_SOME) {
+        return parseIfSomeStmt();
     }
     if (match(b::lexer::TokenType::KW_IF)) {
         return parseIfStmt();
@@ -2047,27 +2590,29 @@ std::unique_ptr<b::ast::Statement> Parser::parseStatement() {
     }
     if (match(b::lexer::TokenType::KW_BREAK)) {
         consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after 'break'");
-        return std::make_unique<b::ast::BreakStmt>();
+        return makeNode<b::ast::BreakStmt>(nodeStart);
     }
     if (match(b::lexer::TokenType::KW_CONTINUE)) {
         consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after 'continue'");
-        return std::make_unique<b::ast::ContinueStmt>();
+        return makeNode<b::ast::ContinueStmt>(nodeStart);
     }
 
     return parseExpressionStmt();
 }
 
 std::unique_ptr<b::ast::Statement> Parser::parseBlock() {
+    size_t nodeStart = current;
     std::vector<std::unique_ptr<b::ast::Statement>> statements;
 
     while (!check(b::lexer::TokenType::RBRACE) && !isAtEnd()) {
         statements.push_back(parseStatement());
     }
 
-    return std::make_unique<b::ast::Block>(std::move(statements));
+    return makeNode<b::ast::Block>(nodeStart, std::move(statements));
 }
 
 std::unique_ptr<b::ast::Statement> Parser::parseVariableDecl() {
+    size_t nodeStart = current;
     b::ast::Type type = parseType();
     std::string name = consume(b::lexer::TokenType::IDENTIFIER, "Expected variable name" + location()).lexeme;
 
@@ -2092,10 +2637,11 @@ std::unique_ptr<b::ast::Statement> Parser::parseVariableDecl() {
     }
 
     consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after variable declaration" + location());
-    return std::make_unique<b::ast::VariableDecl>(type, name, std::move(initializer), false, arraySize);
+    return makeNode<b::ast::VariableDecl>(nodeStart, type, name, std::move(initializer), false, arraySize);
 }
 
 std::unique_ptr<b::ast::Statement> Parser::parseIfStmt() {
+    size_t nodeStart = current;
     consume(b::lexer::TokenType::LPAREN, "Expected '(' after 'if'");
     auto condition = parseExpression();
     consume(b::lexer::TokenType::RPAREN, "Expected ')' after if condition");
@@ -2107,12 +2653,36 @@ std::unique_ptr<b::ast::Statement> Parser::parseIfStmt() {
         elseBranch = parseStatement();
     }
 
-    return std::make_unique<b::ast::IfStmt>(
+    return makeNode<b::ast::IfStmt>(nodeStart,
         std::move(condition), std::move(thenBranch), std::move(elseBranch)
     );
 }
 
+std::unique_ptr<b::ast::Statement> Parser::parseIfSomeStmt() {
+    size_t nodeStart = current;
+    consume(b::lexer::TokenType::KW_IF, "Expected 'if'");
+    consume(b::lexer::TokenType::KW_SOME, "Expected 'some' after 'if'");
+    bool mutably = match(b::lexer::TokenType::KW_MUT);
+
+    consume(b::lexer::TokenType::LPAREN, "Expected '(' after 'if some'" + location());
+    std::string binding = consume(b::lexer::TokenType::IDENTIFIER,
+                                  "Expected a name to bind the unwrapped value to" + location()).lexeme;
+    consume(b::lexer::TokenType::EQUAL, "Expected '=' after '" + binding + "'" + location());
+    auto source = parseExpression();
+    consume(b::lexer::TokenType::RPAREN, "Expected ')' after the unwrapped value" + location());
+
+    auto thenBranch = parseStatement();
+    std::unique_ptr<b::ast::Statement> elseBranch = nullptr;
+    if (match(b::lexer::TokenType::KW_ELSE)) {
+        elseBranch = parseStatement();
+    }
+
+    return makeNode<b::ast::IfSomeStmt>(nodeStart, binding, mutably, std::move(source),
+                                        std::move(thenBranch), std::move(elseBranch));
+}
+
 std::unique_ptr<b::ast::Statement> Parser::parseForStmt() {
+    size_t nodeStart = current;
     consume(b::lexer::TokenType::LPAREN, "Expected '(' after 'for'");
 
     std::unique_ptr<b::ast::Statement> init = nullptr;
@@ -2138,22 +2708,24 @@ std::unique_ptr<b::ast::Statement> Parser::parseForStmt() {
 
     auto body = parseStatement();
 
-    return std::make_unique<b::ast::ForStmt>(
+    return makeNode<b::ast::ForStmt>(nodeStart,
         std::move(init), std::move(condition), std::move(increment), std::move(body)
     );
 }
 
 std::unique_ptr<b::ast::Statement> Parser::parseWhileStmt() {
+    size_t nodeStart = current;
     consume(b::lexer::TokenType::LPAREN, "Expected '(' after 'while'");
     auto condition = parseExpression();
     consume(b::lexer::TokenType::RPAREN, "Expected ')' after while condition");
 
     auto body = parseStatement();
 
-    return std::make_unique<b::ast::WhileStmt>(std::move(condition), std::move(body));
+    return makeNode<b::ast::WhileStmt>(nodeStart, std::move(condition), std::move(body));
 }
 
 std::unique_ptr<b::ast::Statement> Parser::parseSwitchStmt() {
+    size_t nodeStart = current;
     consume(b::lexer::TokenType::LPAREN, "Expected '(' after 'switch'");
     auto condition = parseExpression();
     consume(b::lexer::TokenType::RPAREN, "Expected ')' after switch condition");
@@ -2192,10 +2764,11 @@ std::unique_ptr<b::ast::Statement> Parser::parseSwitchStmt() {
     }
 
     consume(b::lexer::TokenType::RBRACE, "Expected '}' after switch body");
-    return std::make_unique<b::ast::SwitchStmt>(std::move(condition), std::move(cases));
+    return makeNode<b::ast::SwitchStmt>(nodeStart, std::move(condition), std::move(cases));
 }
 
 std::unique_ptr<b::ast::Statement> Parser::parseReturnStmt() {
+    size_t nodeStart = current;
     std::unique_ptr<b::ast::Expression> value = nullptr;
 
     if (!check(b::lexer::TokenType::SEMICOLON)) {
@@ -2203,25 +2776,28 @@ std::unique_ptr<b::ast::Statement> Parser::parseReturnStmt() {
     }
 
     consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after return statement");
-    return std::make_unique<b::ast::ReturnStmt>(std::move(value));
+    return makeNode<b::ast::ReturnStmt>(nodeStart, std::move(value));
 }
 
 std::unique_ptr<b::ast::Statement> Parser::parseExpressionStmt() {
+    size_t nodeStart = current;
     auto expr = parseExpression();
     consume(b::lexer::TokenType::SEMICOLON, "Expected ';' after expression");
-    return std::make_unique<b::ast::ExpressionStmt>(std::move(expr));
+    return makeNode<b::ast::ExpressionStmt>(nodeStart, std::move(expr));
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parseExpression() {
+    size_t nodeStart = current;
     return parseAssignment();
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parseAssignment() {
+    size_t nodeStart = current;
     auto expr = parseLogicalOr();
 
     if (match(b::lexer::TokenType::EQUAL)) {
         auto right = parseAssignment();
-        return std::make_unique<b::ast::BinaryOp>(
+        return makeNode<b::ast::BinaryOp>(nodeStart,
             b::ast::BinaryOp::Operator::ASSIGN,
             std::move(expr),
             std::move(right)
@@ -2232,11 +2808,12 @@ std::unique_ptr<b::ast::Expression> Parser::parseAssignment() {
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parseLogicalOr() {
+    size_t nodeStart = current;
     auto expr = parseLogicalAnd();
 
     while (match(b::lexer::TokenType::PIPE_PIPE)) {
         auto right = parseLogicalAnd();
-        expr = std::make_unique<b::ast::BinaryOp>(
+        expr = makeNode<b::ast::BinaryOp>(nodeStart,
             b::ast::BinaryOp::Operator::LOGICAL_OR,
             std::move(expr),
             std::move(right)
@@ -2247,11 +2824,12 @@ std::unique_ptr<b::ast::Expression> Parser::parseLogicalOr() {
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parseLogicalAnd() {
+    size_t nodeStart = current;
     auto expr = parseBitwiseOr();
 
     while (match(b::lexer::TokenType::AND_AND)) {
         auto right = parseBitwiseOr();
-        expr = std::make_unique<b::ast::BinaryOp>(
+        expr = makeNode<b::ast::BinaryOp>(nodeStart,
             b::ast::BinaryOp::Operator::LOGICAL_AND,
             std::move(expr),
             std::move(right)
@@ -2262,11 +2840,12 @@ std::unique_ptr<b::ast::Expression> Parser::parseLogicalAnd() {
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parseBitwiseOr() {
+    size_t nodeStart = current;
     auto expr = parseBitwiseXor();
 
     while (match(b::lexer::TokenType::PIPE)) {
         auto right = parseBitwiseXor();
-        expr = std::make_unique<b::ast::BinaryOp>(
+        expr = makeNode<b::ast::BinaryOp>(nodeStart,
             b::ast::BinaryOp::Operator::BITWISE_OR,
             std::move(expr),
             std::move(right)
@@ -2277,11 +2856,12 @@ std::unique_ptr<b::ast::Expression> Parser::parseBitwiseOr() {
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parseBitwiseXor() {
+    size_t nodeStart = current;
     auto expr = parseBitwiseAnd();
 
     while (match(b::lexer::TokenType::CARET)) {
         auto right = parseBitwiseAnd();
-        expr = std::make_unique<b::ast::BinaryOp>(
+        expr = makeNode<b::ast::BinaryOp>(nodeStart,
             b::ast::BinaryOp::Operator::BITWISE_XOR,
             std::move(expr),
             std::move(right)
@@ -2292,11 +2872,12 @@ std::unique_ptr<b::ast::Expression> Parser::parseBitwiseXor() {
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parseBitwiseAnd() {
+    size_t nodeStart = current;
     auto expr = parseEquality();
 
     while (match(b::lexer::TokenType::AMPERSAND)) {
         auto right = parseEquality();
-        expr = std::make_unique<b::ast::BinaryOp>(
+        expr = makeNode<b::ast::BinaryOp>(nodeStart,
             b::ast::BinaryOp::Operator::BITWISE_AND,
             std::move(expr),
             std::move(right)
@@ -2307,19 +2888,20 @@ std::unique_ptr<b::ast::Expression> Parser::parseBitwiseAnd() {
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parseEquality() {
+    size_t nodeStart = current;
     auto expr = parseComparison();
 
     while (true) {
         if (match(b::lexer::TokenType::EQUAL_EQUAL)) {
             auto right = parseComparison();
-            expr = std::make_unique<b::ast::BinaryOp>(
+            expr = makeNode<b::ast::BinaryOp>(nodeStart,
                 b::ast::BinaryOp::Operator::EQUAL,
                 std::move(expr),
                 std::move(right)
             );
         } else if (match(b::lexer::TokenType::NOT_EQUAL)) {
             auto right = parseComparison();
-            expr = std::make_unique<b::ast::BinaryOp>(
+            expr = makeNode<b::ast::BinaryOp>(nodeStart,
                 b::ast::BinaryOp::Operator::NOT_EQUAL,
                 std::move(expr),
                 std::move(right)
@@ -2333,19 +2915,20 @@ std::unique_ptr<b::ast::Expression> Parser::parseEquality() {
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parseShift() {
+    size_t nodeStart = current;
     auto expr = parseAdditive();
 
     while (true) {
         if (match(b::lexer::TokenType::LESS_LESS)) {
             auto right = parseAdditive();
-            expr = std::make_unique<b::ast::BinaryOp>(
+            expr = makeNode<b::ast::BinaryOp>(nodeStart,
                 b::ast::BinaryOp::Operator::SHIFT_LEFT,
                 std::move(expr),
                 std::move(right)
             );
         } else if (match(b::lexer::TokenType::GREATER_GREATER)) {
             auto right = parseAdditive();
-            expr = std::make_unique<b::ast::BinaryOp>(
+            expr = makeNode<b::ast::BinaryOp>(nodeStart,
                 b::ast::BinaryOp::Operator::SHIFT_RIGHT,
                 std::move(expr),
                 std::move(right)
@@ -2359,33 +2942,34 @@ std::unique_ptr<b::ast::Expression> Parser::parseShift() {
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parseComparison() {
+    size_t nodeStart = current;
     auto expr = parseShift();
 
     while (true) {
         if (match(b::lexer::TokenType::LESS)) {
             auto right = parseShift();
-            expr = std::make_unique<b::ast::BinaryOp>(
+            expr = makeNode<b::ast::BinaryOp>(nodeStart,
                 b::ast::BinaryOp::Operator::LESS,
                 std::move(expr),
                 std::move(right)
             );
         } else if (match(b::lexer::TokenType::LESS_EQUAL)) {
             auto right = parseShift();
-            expr = std::make_unique<b::ast::BinaryOp>(
+            expr = makeNode<b::ast::BinaryOp>(nodeStart,
                 b::ast::BinaryOp::Operator::LESS_EQUAL,
                 std::move(expr),
                 std::move(right)
             );
         } else if (match(b::lexer::TokenType::GREATER)) {
             auto right = parseShift();
-            expr = std::make_unique<b::ast::BinaryOp>(
+            expr = makeNode<b::ast::BinaryOp>(nodeStart,
                 b::ast::BinaryOp::Operator::GREATER,
                 std::move(expr),
                 std::move(right)
             );
         } else if (match(b::lexer::TokenType::GREATER_EQUAL)) {
             auto right = parseShift();
-            expr = std::make_unique<b::ast::BinaryOp>(
+            expr = makeNode<b::ast::BinaryOp>(nodeStart,
                 b::ast::BinaryOp::Operator::GREATER_EQUAL,
                 std::move(expr),
                 std::move(right)
@@ -2399,19 +2983,20 @@ std::unique_ptr<b::ast::Expression> Parser::parseComparison() {
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parseAdditive() {
+    size_t nodeStart = current;
     auto expr = parseMultiplicative();
 
     while (true) {
         if (match(b::lexer::TokenType::PLUS)) {
             auto right = parseMultiplicative();
-            expr = std::make_unique<b::ast::BinaryOp>(
+            expr = makeNode<b::ast::BinaryOp>(nodeStart,
                 b::ast::BinaryOp::Operator::PLUS,
                 std::move(expr),
                 std::move(right)
             );
         } else if (match(b::lexer::TokenType::MINUS)) {
             auto right = parseMultiplicative();
-            expr = std::make_unique<b::ast::BinaryOp>(
+            expr = makeNode<b::ast::BinaryOp>(nodeStart,
                 b::ast::BinaryOp::Operator::MINUS,
                 std::move(expr),
                 std::move(right)
@@ -2425,26 +3010,27 @@ std::unique_ptr<b::ast::Expression> Parser::parseAdditive() {
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parseMultiplicative() {
+    size_t nodeStart = current;
     auto expr = parseUnary();
 
     while (true) {
         if (match(b::lexer::TokenType::STAR)) {
             auto right = parseUnary();
-            expr = std::make_unique<b::ast::BinaryOp>(
+            expr = makeNode<b::ast::BinaryOp>(nodeStart,
                 b::ast::BinaryOp::Operator::MULTIPLY,
                 std::move(expr),
                 std::move(right)
             );
         } else if (match(b::lexer::TokenType::SLASH)) {
             auto right = parseUnary();
-            expr = std::make_unique<b::ast::BinaryOp>(
+            expr = makeNode<b::ast::BinaryOp>(nodeStart,
                 b::ast::BinaryOp::Operator::DIVIDE,
                 std::move(expr),
                 std::move(right)
             );
         } else if (match(b::lexer::TokenType::PERCENT)) {
             auto right = parseUnary();
-            expr = std::make_unique<b::ast::BinaryOp>(
+            expr = makeNode<b::ast::BinaryOp>(nodeStart,
                 b::ast::BinaryOp::Operator::MODULO,
                 std::move(expr),
                 std::move(right)
@@ -2458,11 +3044,82 @@ std::unique_ptr<b::ast::Expression> Parser::parseMultiplicative() {
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parseUnary() {
+    size_t nodeStart = current;
+    if (check(b::lexer::TokenType::KW_NEW) && current + 1 < tokens.size() &&
+        tokens[current + 1].type == b::lexer::TokenType::LBRACKET) {
+        advance();
+        advance();
+        b::ast::Type element = parseType();
+        consume(b::lexer::TokenType::RBRACKET, "Expected ']' after the element type" + location());
+        if (element.slice || element.isBorrow()) {
+            throw ParseException("A slice holds values or owned handles, not '" +
+                                 b::ast::typeToString(element) + "'" + location());
+        }
+        consume(b::lexer::TokenType::LPAREN, "Expected '(' with the element count" + location());
+        size_t countStart = current;
+        auto count = parseExpression();
+        size_t countEnd = current;
+        consume(b::lexer::TokenType::RPAREN, "Expected ')' after the element count" + location());
+
+        int staticLength = -1;
+        if (countEnd == countStart + 1 &&
+            tokens[countStart].type == b::lexer::TokenType::INTEGER) {
+            try {
+                long long value = std::stoll(tokens[countStart].value);
+                if (value >= 0 && value <= 2147483647LL) {
+                    staticLength = static_cast<int>(value);
+                }
+            } catch (const std::exception&) {
+            }
+        } else if (countEnd == countStart + 1 &&
+                   tokens[countStart].type == b::lexer::TokenType::IDENTIFIER) {
+            auto known = constantLengths.find(tokens[countStart].lexeme);
+            if (known != constantLengths.end()) {
+                staticLength = known->second;
+            }
+        }
+
+        bool holdsOwned = element.isOwned();
+        element.slice = true;
+        element.ownedElements = holdsOwned;
+        element.fixedLength = staticLength;
+        element.pointerLevel = 1;
+        element.ownership = b::ast::Ownership::Owned;
+        element.optional = false;
+        return makeNode<b::ast::NewSliceExpr>(nodeStart, element, std::move(count));
+    }
+
+    if (check(b::lexer::TokenType::KW_NEW)) {
+        advance();
+        b::ast::Type target = parseType();
+        if (!target.isStruct() || target.pointerLevel != 0) {
+            throw ParseException("'new' needs a struct type, got '" + b::ast::typeToString(target) +
+                                 "'" + location());
+        }
+        target.ownership = b::ast::Ownership::Owned;
+        target.pointerLevel = 1;
+
+        std::vector<std::pair<std::string, std::unique_ptr<b::ast::Expression>>> fields;
+        if (match(b::lexer::TokenType::LBRACE)) {
+            while (!check(b::lexer::TokenType::RBRACE) && !isAtEnd()) {
+                std::string field = consume(b::lexer::TokenType::IDENTIFIER,
+                                            "Expected a field name in 'new'" + location()).lexeme;
+                consume(b::lexer::TokenType::COLON, "Expected ':' after field name" + location());
+                fields.emplace_back(field, parseExpression());
+                if (!match(b::lexer::TokenType::COMMA)) {
+                    break;
+                }
+            }
+            consume(b::lexer::TokenType::RBRACE, "Expected '}' after field initializers" + location());
+        }
+        return makeNode<b::ast::NewExpr>(nodeStart, target, std::move(fields));
+    }
+
     if (match(b::lexer::TokenType::KW_SIZEOF)) {
         consume(b::lexer::TokenType::LPAREN, "Expected '(' after 'sizeof'" + location());
         b::ast::Type type = parseType();
         consume(b::lexer::TokenType::RPAREN, "Expected ')' after sizeof type" + location());
-        return std::make_unique<b::ast::SizeofExpr>(type);
+        return makeNode<b::ast::SizeofExpr>(nodeStart, type);
     }
 
     if (check(b::lexer::TokenType::LPAREN)) {
@@ -2486,7 +3143,7 @@ std::unique_ptr<b::ast::Expression> Parser::parseUnary() {
             if (check(b::lexer::TokenType::RPAREN)) {
                 advance();
                 auto operand = parseUnary();
-                return std::make_unique<b::ast::CastExpr>(castType, std::move(operand));
+                return makeNode<b::ast::CastExpr>(nodeStart, castType, std::move(operand));
             }
         }
 
@@ -2495,7 +3152,7 @@ std::unique_ptr<b::ast::Expression> Parser::parseUnary() {
 
     if (match(b::lexer::TokenType::MINUS)) {
         auto operand = parseUnary();
-        return std::make_unique<b::ast::UnaryOp>(
+        return makeNode<b::ast::UnaryOp>(nodeStart,
             b::ast::UnaryOp::Operator::NEGATE,
             std::move(operand)
         );
@@ -2503,7 +3160,7 @@ std::unique_ptr<b::ast::Expression> Parser::parseUnary() {
 
     if (match(b::lexer::TokenType::BANG)) {
         auto operand = parseUnary();
-        return std::make_unique<b::ast::UnaryOp>(
+        return makeNode<b::ast::UnaryOp>(nodeStart,
             b::ast::UnaryOp::Operator::NOT,
             std::move(operand)
         );
@@ -2511,7 +3168,7 @@ std::unique_ptr<b::ast::Expression> Parser::parseUnary() {
 
     if (match(b::lexer::TokenType::TILDE)) {
         auto operand = parseUnary();
-        return std::make_unique<b::ast::UnaryOp>(
+        return makeNode<b::ast::UnaryOp>(nodeStart,
             b::ast::UnaryOp::Operator::BITWISE_NOT,
             std::move(operand)
         );
@@ -2519,24 +3176,28 @@ std::unique_ptr<b::ast::Expression> Parser::parseUnary() {
 
     if (match(b::lexer::TokenType::STAR)) {
         auto operand = parseUnary();
-        return std::make_unique<b::ast::UnaryOp>(
+        return makeNode<b::ast::UnaryOp>(nodeStart,
             b::ast::UnaryOp::Operator::DEREF,
             std::move(operand)
         );
     }
 
     if (match(b::lexer::TokenType::AMPERSAND)) {
+        bool mutably = match(b::lexer::TokenType::KW_MUT);
         auto operand = parseUnary();
-        return std::make_unique<b::ast::UnaryOp>(
+        auto borrow = makeNode<b::ast::UnaryOp>(nodeStart,
             b::ast::UnaryOp::Operator::ADDRESS_OF,
             std::move(operand)
         );
+        borrow->mutableBorrow = mutably;
+        return borrow;
     }
 
     return parsePostfix();
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parsePostfix() {
+    size_t nodeStart = current;
     auto expr = parsePrimary();
 
     while (true) {
@@ -2553,17 +3214,18 @@ std::unique_ptr<b::ast::Expression> Parser::parsePostfix() {
 
             if (auto* identifier = dynamic_cast<b::ast::Identifier*>(expr.get())) {
                 std::string funcName = identifier->name;
-                expr = std::make_unique<b::ast::FunctionCall>(funcName, std::move(arguments));
+                expr = makeNode<b::ast::FunctionCall>(nodeStart, funcName, std::move(arguments));
             } else {
-                throw ParseException("Invalid function call");
+
+                expr = makeNode<b::ast::FunctionCall>(nodeStart, std::move(expr), std::move(arguments));
             }
         } else if (match(b::lexer::TokenType::DOT) || match(b::lexer::TokenType::ARROW)) {
             std::string memberName = consume(b::lexer::TokenType::IDENTIFIER, "Expected member name after '.'/'->'").lexeme;
-            expr = std::make_unique<b::ast::MemberAccess>(std::move(expr), memberName);
+            expr = makeNode<b::ast::MemberAccess>(nodeStart, std::move(expr), memberName);
         } else if (match(b::lexer::TokenType::LBRACKET)) {
             auto indexExpr = parseExpression();
             consume(b::lexer::TokenType::RBRACKET, "Expected ']' after array index");
-            expr = std::make_unique<b::ast::ArrayAccess>(std::move(expr), std::move(indexExpr));
+            expr = makeNode<b::ast::ArrayAccess>(nodeStart, std::move(expr), std::move(indexExpr));
         } else {
             break;
         }
@@ -2573,34 +3235,43 @@ std::unique_ptr<b::ast::Expression> Parser::parsePostfix() {
 }
 
 std::unique_ptr<b::ast::Expression> Parser::parsePrimary() {
+    size_t nodeStart = current;
+    if (match(b::lexer::TokenType::KW_NONE)) {
+        return makeNode<b::ast::Literal>(nodeStart, b::ast::Literal::Kind::NONE, "none");
+    }
+
     if (match(b::lexer::TokenType::KW_TRUE)) {
-        return std::make_unique<b::ast::Literal>(b::ast::Literal::Kind::BOOLEAN, "true");
+        return makeNode<b::ast::Literal>(nodeStart, b::ast::Literal::Kind::BOOLEAN, "true");
     }
 
     if (match(b::lexer::TokenType::KW_FALSE)) {
-        return std::make_unique<b::ast::Literal>(b::ast::Literal::Kind::BOOLEAN, "false");
+        return makeNode<b::ast::Literal>(nodeStart, b::ast::Literal::Kind::BOOLEAN, "false");
     }
 
     if (match(b::lexer::TokenType::INTEGER)) {
-        return std::make_unique<b::ast::Literal>(
+        return makeNode<b::ast::Literal>(nodeStart,
             b::ast::Literal::Kind::INTEGER, previous().value
         );
     }
 
     if (match(b::lexer::TokenType::CHAR_LITERAL)) {
-        return std::make_unique<b::ast::Literal>(
+        return makeNode<b::ast::Literal>(nodeStart,
             b::ast::Literal::Kind::INTEGER, previous().value
         );
     }
 
     if (match(b::lexer::TokenType::FLOAT)) {
-        return std::make_unique<b::ast::Literal>(
+        return makeNode<b::ast::Literal>(nodeStart,
             b::ast::Literal::Kind::FLOAT, previous().value
         );
     }
 
     if (match(b::lexer::TokenType::STRING)) {
-        return std::make_unique<b::ast::Literal>(
+        if (check(b::lexer::TokenType::STRING)) {
+            throw ParseException("Two string literals side by side are not joined in B; "
+                                 "write one literal, or build it with text::concat" + location());
+        }
+        return makeNode<b::ast::Literal>(nodeStart,
             b::ast::Literal::Kind::STRING, previous().value
         );
     }
@@ -2611,7 +3282,7 @@ std::unique_ptr<b::ast::Expression> Parser::parsePrimary() {
         tokens[current + 1].type == b::lexer::TokenType::LESS) {
         std::string templateName = advance().lexeme;
         std::vector<b::ast::Type> typeArgs = parseGenericArgList();
-        return std::make_unique<b::ast::Identifier>(
+        return makeNode<b::ast::Identifier>(nodeStart,
             requestInstantiation(templateName, false, typeArgs)
         );
     }
@@ -2621,7 +3292,7 @@ std::unique_ptr<b::ast::Expression> Parser::parsePrimary() {
         if (enumIt != enumConstants.end()) {
             std::string owner = enumConstantOwner[peek().lexeme];
             advance();
-            return std::make_unique<b::ast::Literal>(
+            return makeNode<b::ast::Literal>(nodeStart,
                 b::ast::Literal::Kind::INTEGER, std::to_string(enumIt->second), owner
             );
         }
@@ -2633,7 +3304,7 @@ std::unique_ptr<b::ast::Expression> Parser::parsePrimary() {
     }
 
     if (match(b::lexer::TokenType::IDENTIFIER)) {
-        return std::make_unique<b::ast::Identifier>(previous().lexeme);
+        return makeNode<b::ast::Identifier>(nodeStart, previous().lexeme);
     }
 
     if (match(b::lexer::TokenType::LPAREN)) {
@@ -2647,7 +3318,996 @@ std::unique_ptr<b::ast::Expression> Parser::parsePrimary() {
 
 }
 
+namespace b::sema {
+
+class Analyzer : public b::ast::ASTVisitor {
+public:
+    explicit Analyzer(b::diag::Reporter& reporter) : reporter(reporter) {}
+
+    void run(b::ast::Program* program);
+
+private:
+    struct Local {
+        std::string name;
+        b::ast::Type type;
+        b::ast::SourceLocation declaredAt;
+        bool isParameter = false;
+        bool read = false;
+        bool written = false;
+        bool moved = false;
+        b::ast::SourceLocation movedAt;
+        int sharedBorrows = 0;
+        bool mutBorrowed = false;
+        b::ast::SourceLocation borrowedAt;
+        std::string borrowsFrom;
+        bool borrowsMutably = false;
+    };
+
+    struct MoveState {
+        bool moved = false;
+        b::ast::SourceLocation movedAt;
+    };
+    using MoveSnapshot = std::vector<std::vector<MoveState>>;
+
+    struct GlobalInfo {
+        b::ast::Type type;
+        b::ast::SourceLocation declaredAt;
+        bool isPublic = false;
+        bool read = false;
+    };
+
+    struct FunctionInfo {
+        b::ast::SourceLocation declaredAt;
+        bool isPublic = false;
+        bool called = false;
+        size_t parameterCount = 0;
+        std::vector<b::ast::Type> parameterTypes;
+        b::ast::Type returnType;
+    };
+
+    b::diag::Reporter& reporter;
+
+    std::vector<std::vector<Local>> scopes;
+    std::unordered_map<std::string, GlobalInfo> globals;
+    std::unordered_map<std::string, FunctionInfo> functions;
+    std::unordered_set<std::string> structNames;
+    std::unordered_set<std::string> structsWithDrop;
+    std::unordered_set<std::string> builtins;
+    std::string currentFunction;
+
+    static bool isIgnored(const std::string& name) { return !name.empty() && name[0] == '_'; }
+
+    void pushScope() { scopes.emplace_back(); }
+    void popScope();
+
+    Local* findLocal(const std::string& name);
+    void declareLocal(const std::string& name, const b::ast::Type& type,
+                      const b::ast::SourceLocation& where, bool isParameter);
+    void useName(const std::string& name, const b::ast::SourceLocation& where);
+    void assignName(const std::string& name, const b::ast::SourceLocation& where);
+    std::vector<std::string> visibleNames() const;
+
+    void error(const b::ast::SourceLocation& where, const std::string& text,
+               const std::string& help = "");
+    void walk(b::ast::Expression* expr);
+    void walk(b::ast::Statement* stmt);
+
+    void consume(b::ast::Expression* expr, const std::string& what);
+    static std::string borrowRoot(b::ast::Expression* expr);
+    std::string optionalPayloadStruct(b::ast::Expression* expr);
+    void rejectOptionalAccess(b::ast::Expression* target, const std::string& what);
+    bool typeOf(b::ast::Expression* expr, b::ast::Type& out);
+    std::unordered_map<std::string, std::unordered_map<std::string, b::ast::Type>> structFieldTypes;
+    size_t scopeIndexOf(const std::string& name) const;
+    void openBorrow(b::ast::UnaryOp* node);
+    void registerNamedBorrow(const std::string& borrower, b::ast::Expression* initializer);
+    void releaseBorrow(const Local& borrower);
+    MoveSnapshot captureMoves() const;
+    void restoreMoves(const MoveSnapshot& snapshot);
+    void mergeMoves(const MoveSnapshot& branch);
+    void reportMovesInLoop(const MoveSnapshot& before);
+    b::ast::Type currentReturnType;
+    bool pathTerminated = false;
+
+    void visit(b::ast::Literal* node) override;
+    void visit(b::ast::SizeofExpr* node) override;
+    void visit(b::ast::NewExpr* node) override;
+    void visit(b::ast::NewSliceExpr* node) override;
+    void visit(b::ast::Identifier* node) override;
+    void visit(b::ast::BinaryOp* node) override;
+    void visit(b::ast::UnaryOp* node) override;
+    void visit(b::ast::CastExpr* node) override;
+    void visit(b::ast::FunctionCall* node) override;
+    void visit(b::ast::MemberAccess* node) override;
+    void visit(b::ast::ArrayAccess* node) override;
+    void visit(b::ast::VariableDecl* node) override;
+    void visit(b::ast::ReturnStmt* node) override;
+    void visit(b::ast::ExpressionStmt* node) override;
+    void visit(b::ast::Block* node) override;
+    void visit(b::ast::IfStmt* node) override;
+    void visit(b::ast::IfSomeStmt* node) override;
+    void visit(b::ast::ForStmt* node) override;
+    void visit(b::ast::WhileStmt* node) override;
+    void visit(b::ast::BreakStmt* node) override;
+    void visit(b::ast::ContinueStmt* node) override;
+    void visit(b::ast::SwitchStmt* node) override;
+    void visit(b::ast::StructDecl* node) override;
+    void visit(b::ast::FunctionDecl* node) override;
+    void visit(b::ast::Program* node) override;
+};
+
+void Analyzer::error(const b::ast::SourceLocation& where, const std::string& text,
+                     const std::string& help) {
+    reporter.error(where.file, where.line, where.column, text, help);
+}
+
+void Analyzer::walk(b::ast::Expression* expr) {
+    if (expr) {
+        expr->accept(this);
+    }
+}
+
+void Analyzer::walk(b::ast::Statement* stmt) {
+    if (stmt) {
+        stmt->accept(this);
+    }
+}
+
+std::vector<std::string> Analyzer::visibleNames() const {
+    std::vector<std::string> names;
+    for (const auto& scope : scopes) {
+        for (const auto& local : scope) {
+            names.push_back(local.name);
+        }
+    }
+    for (const auto& entry : globals) {
+        names.push_back(entry.first);
+    }
+    for (const auto& entry : functions) {
+        names.push_back(entry.first);
+    }
+    return names;
+}
+
+Analyzer::Local* Analyzer::findLocal(const std::string& name) {
+    for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope) {
+        for (auto local = scope->rbegin(); local != scope->rend(); ++local) {
+            if (local->name == name) {
+                return &*local;
+            }
+        }
+    }
+    return nullptr;
+}
+
+void Analyzer::declareLocal(const std::string& name, const b::ast::Type& type,
+                            const b::ast::SourceLocation& where, bool isParameter) {
+    if (scopes.empty()) {
+        return;
+    }
+    for (const auto& existing : scopes.back()) {
+        if (existing.name == name) {
+            error(where, "'" + name + "' is already declared in this scope",
+                  "the earlier declaration is at line " + std::to_string(existing.declaredAt.line));
+            return;
+        }
+    }
+    scopes.back().push_back({name, type, where, isParameter, false, false});
+}
+
+void Analyzer::popScope() {
+    if (scopes.empty()) {
+        return;
+    }
+    for (const auto& local : scopes.back()) {
+        releaseBorrow(local);
+    }
+    for (const auto& local : scopes.back()) {
+        if (local.read || isIgnored(local.name)) {
+            continue;
+        }
+        if (structsWithDrop.count(local.type.structName)) {
+            continue;
+        }
+        std::string kind = local.isParameter ? "parameter" : "variable";
+        std::string help = "remove it, or rename it to '_" + local.name +
+                           "' if it is deliberately unused";
+        if (local.written && !local.isParameter) {
+            error(local.declaredAt, "'" + local.name + "' is assigned but its value is never read",
+                  help);
+        } else {
+            error(local.declaredAt, "unused " + kind + " '" + local.name + "'", help);
+        }
+    }
+    scopes.pop_back();
+}
+
+void Analyzer::useName(const std::string& name, const b::ast::SourceLocation& where) {
+    if (Local* local = findLocal(name)) {
+        local->read = true;
+        if (local->moved) {
+            error(where, "'" + name + "' is used after it was moved",
+                  "it was moved at line " + std::to_string(local->movedAt.line));
+        } else if (local->mutBorrowed) {
+            error(where, "cannot use '" + name + "' while it is mutably borrowed",
+                  "the borrow starts at line " + std::to_string(local->borrowedAt.line));
+        }
+        return;
+    }
+    auto globalIt = globals.find(name);
+    if (globalIt != globals.end()) {
+        globalIt->second.read = true;
+        return;
+    }
+    auto functionIt = functions.find(name);
+    if (functionIt != functions.end()) {
+        functionIt->second.called = true;
+        return;
+    }
+    if (builtins.count(name) || structNames.count(name)) {
+        return;
+    }
+
+    std::string suggestion = b::diag::closestMatch(name, visibleNames());
+    error(where, "cannot find '" + name + "' in this scope",
+          suggestion.empty() ? "" : "did you mean '" + suggestion + "'?");
+}
+
+void Analyzer::assignName(const std::string& name, const b::ast::SourceLocation& where) {
+    if (Local* local = findLocal(name)) {
+        local->written = true;
+        return;
+    }
+    auto globalIt = globals.find(name);
+    if (globalIt != globals.end()) {
+        return;
+    }
+    useName(name, where);
+}
+
+
+Analyzer::MoveSnapshot Analyzer::captureMoves() const {
+    MoveSnapshot snapshot;
+    snapshot.reserve(scopes.size());
+    for (const auto& scope : scopes) {
+        std::vector<MoveState> states;
+        states.reserve(scope.size());
+        for (const auto& local : scope) {
+            states.push_back({local.moved, local.movedAt});
+        }
+        snapshot.push_back(std::move(states));
+    }
+    return snapshot;
+}
+
+void Analyzer::restoreMoves(const MoveSnapshot& snapshot) {
+    for (size_t i = 0; i < scopes.size() && i < snapshot.size(); ++i) {
+        for (size_t j = 0; j < scopes[i].size() && j < snapshot[i].size(); ++j) {
+            scopes[i][j].moved = snapshot[i][j].moved;
+            scopes[i][j].movedAt = snapshot[i][j].movedAt;
+        }
+    }
+}
+
+void Analyzer::mergeMoves(const MoveSnapshot& branch) {
+    for (size_t i = 0; i < scopes.size() && i < branch.size(); ++i) {
+        for (size_t j = 0; j < scopes[i].size() && j < branch[i].size(); ++j) {
+            if (branch[i][j].moved && !scopes[i][j].moved) {
+                scopes[i][j].moved = true;
+                scopes[i][j].movedAt = branch[i][j].movedAt;
+            }
+        }
+    }
+}
+
+void Analyzer::reportMovesInLoop(const MoveSnapshot& before) {
+    for (size_t i = 0; i < scopes.size() && i < before.size(); ++i) {
+        for (size_t j = 0; j < scopes[i].size() && j < before[i].size(); ++j) {
+            if (scopes[i][j].moved && !before[i][j].moved) {
+                error(scopes[i][j].movedAt,
+                      "'" + scopes[i][j].name + "' is moved inside a loop, so the next iteration "
+                      "would move it again",
+                      "move it outside the loop, or create a new value each iteration");
+            }
+        }
+    }
+}
+
+void Analyzer::consume(b::ast::Expression* expr, const std::string& what) {
+    auto* ident = dynamic_cast<b::ast::Identifier*>(expr);
+    if (!ident) {
+        bool isPlace = dynamic_cast<b::ast::MemberAccess*>(expr) != nullptr ||
+                       dynamic_cast<b::ast::ArrayAccess*>(expr) != nullptr;
+        b::ast::Type placeType;
+        if (isPlace && typeOf(expr, placeType) && placeType.isOwned()) {
+            std::string root = borrowRoot(expr);
+            error(expr->loc, "cannot move ownership out of '" + root + "'",
+                  "borrow it with '&' instead, or copy the value");
+            return;
+        }
+        walk(expr);
+        return;
+    }
+    Local* local = findLocal(ident->name);
+    if (!local || !local->type.isOwned()) {
+        walk(expr);
+        return;
+    }
+    if (local->moved) {
+        error(ident->loc, "'" + ident->name + "' has already been moved",
+              "it was moved at line " + std::to_string(local->movedAt.line));
+        return;
+    }
+    if (local->mutBorrowed || local->sharedBorrows > 0) {
+        error(ident->loc, "cannot move '" + ident->name + "' while it is borrowed",
+              "the borrow starts at line " + std::to_string(local->borrowedAt.line));
+        return;
+    }
+    local->read = true;
+    local->moved = true;
+    local->movedAt = ident->loc;
+    ident->isMoveSource = true;
+    (void)what;
+}
+
+
+bool Analyzer::typeOf(b::ast::Expression* expr, b::ast::Type& out) {
+    if (auto* ident = dynamic_cast<b::ast::Identifier*>(expr)) {
+        if (Local* local = findLocal(ident->name)) {
+            out = local->type;
+            return true;
+        }
+        auto globalIt = globals.find(ident->name);
+        if (globalIt != globals.end()) {
+            out = globalIt->second.type;
+            return true;
+        }
+        return false;
+    }
+    if (auto* member = dynamic_cast<b::ast::MemberAccess*>(expr)) {
+        b::ast::Type objectType;
+        if (!typeOf(member->object.get(), objectType) || objectType.structName.empty()) {
+            return false;
+        }
+        auto structIt = structFieldTypes.find(objectType.structName);
+        if (structIt == structFieldTypes.end()) {
+            return false;
+        }
+        auto fieldIt = structIt->second.find(member->member);
+        if (fieldIt == structIt->second.end()) {
+            return false;
+        }
+        out = fieldIt->second;
+        return true;
+    }
+    if (auto* element = dynamic_cast<b::ast::ArrayAccess*>(expr)) {
+        b::ast::Type arrayType;
+        if (!typeOf(element->array.get(), arrayType) || !arrayType.slice) {
+            return false;
+        }
+        bool holdsOwned = arrayType.ownedElements;
+        out = arrayType;
+        out.slice = false;
+        out.ownedElements = false;
+        out.fixedLength = -1;
+        out.optional = false;
+        out.ownership = holdsOwned ? b::ast::Ownership::Owned : b::ast::Ownership::Value;
+        out.pointerLevel = holdsOwned ? 1 : 0;
+        return true;
+    }
+    if (auto* unary = dynamic_cast<b::ast::UnaryOp*>(expr)) {
+        if (unary->op == b::ast::UnaryOp::Operator::ADDRESS_OF) {
+            return typeOf(unary->operand.get(), out);
+        }
+        return false;
+    }
+    if (auto* call = dynamic_cast<b::ast::FunctionCall*>(expr)) {
+        auto it = functions.find(call->functionName);
+        if (it == functions.end()) {
+            return false;
+        }
+        out = it->second.returnType;
+        return true;
+    }
+    return false;
+}
+
+std::string Analyzer::optionalPayloadStruct(b::ast::Expression* expr) {
+    b::ast::Type type;
+    if (!typeOf(expr, type) || !type.optional) {
+        return "";
+    }
+    return type.structName;
+}
+
+std::string Analyzer::borrowRoot(b::ast::Expression* expr) {
+    if (auto* ident = dynamic_cast<b::ast::Identifier*>(expr)) {
+        return ident->name;
+    }
+    if (auto* member = dynamic_cast<b::ast::MemberAccess*>(expr)) {
+        return borrowRoot(member->object.get());
+    }
+    if (auto* element = dynamic_cast<b::ast::ArrayAccess*>(expr)) {
+        return borrowRoot(element->array.get());
+    }
+    if (auto* unary = dynamic_cast<b::ast::UnaryOp*>(expr)) {
+        if (unary->op == b::ast::UnaryOp::Operator::DEREF ||
+            unary->op == b::ast::UnaryOp::Operator::ADDRESS_OF) {
+            return borrowRoot(unary->operand.get());
+        }
+    }
+    return "";
+}
+
+size_t Analyzer::scopeIndexOf(const std::string& name) const {
+    for (size_t i = scopes.size(); i > 0; --i) {
+        for (const auto& local : scopes[i - 1]) {
+            if (local.name == name) {
+                return i - 1;
+            }
+        }
+    }
+    return scopes.size();
+}
+
+void Analyzer::openBorrow(b::ast::UnaryOp* node) {
+    std::string root = borrowRoot(node->operand.get());
+    if (root.empty()) {
+        return;
+    }
+    Local* target = findLocal(root);
+    if (!target) {
+        return;
+    }
+    if (target->moved) {
+        error(node->loc, "cannot borrow '" + root + "' because it has been moved",
+              "it was moved at line " + std::to_string(target->movedAt.line));
+        return;
+    }
+    if (node->mutableBorrow) {
+        if (target->mutBorrowed) {
+            error(node->loc, "'" + root + "' is already mutably borrowed",
+                  "the earlier borrow starts at line " + std::to_string(target->borrowedAt.line));
+        } else if (target->sharedBorrows > 0) {
+            error(node->loc, "cannot borrow '" + root + "' mutably while it is borrowed",
+                  "the shared borrow starts at line " + std::to_string(target->borrowedAt.line));
+        }
+    } else if (target->mutBorrowed) {
+        error(node->loc, "cannot borrow '" + root + "' while it is mutably borrowed",
+              "the mutable borrow starts at line " + std::to_string(target->borrowedAt.line));
+    }
+}
+
+void Analyzer::registerNamedBorrow(const std::string& borrower, b::ast::Expression* initializer) {
+    auto* unary = dynamic_cast<b::ast::UnaryOp*>(initializer);
+    if (!unary || unary->op != b::ast::UnaryOp::Operator::ADDRESS_OF) {
+        return;
+    }
+    std::string root = borrowRoot(unary->operand.get());
+    if (root.empty()) {
+        return;
+    }
+    Local* target = findLocal(root);
+    Local* holder = findLocal(borrower);
+    if (!target || !holder) {
+        return;
+    }
+
+    if (scopeIndexOf(root) > scopeIndexOf(borrower)) {
+        error(unary->loc, "'" + borrower + "' would outlive '" + root + "'",
+              "'" + root + "' is released at the end of its block, leaving the borrow dangling");
+        return;
+    }
+
+    holder->borrowsFrom = root;
+    holder->borrowsMutably = unary->mutableBorrow;
+    if (unary->mutableBorrow) {
+        target->mutBorrowed = true;
+    } else {
+        target->sharedBorrows++;
+    }
+    target->borrowedAt = unary->loc;
+}
+
+void Analyzer::releaseBorrow(const Local& borrower) {
+    if (borrower.borrowsFrom.empty()) {
+        return;
+    }
+    if (Local* target = findLocal(borrower.borrowsFrom)) {
+        if (borrower.borrowsMutably) {
+            target->mutBorrowed = false;
+        } else if (target->sharedBorrows > 0) {
+            target->sharedBorrows--;
+        }
+    }
+}
+
+void Analyzer::visit(b::ast::Literal* node) { (void)node; }
+
+void Analyzer::visit(b::ast::SizeofExpr* node) { (void)node; }
+
+void Analyzer::visit(b::ast::NewSliceExpr* node) { walk(node->count.get()); }
+
+void Analyzer::visit(b::ast::NewExpr* node) {
+    auto structIt = structFieldTypes.find(node->type.structName);
+    for (const auto& field : node->fields) {
+        bool takesOwnership = false;
+        if (structIt != structFieldTypes.end()) {
+            auto fieldIt = structIt->second.find(field.first);
+            takesOwnership = fieldIt != structIt->second.end() && fieldIt->second.isOwned();
+        }
+        if (takesOwnership) {
+            consume(field.second.get(), "field initializer");
+        } else {
+            walk(field.second.get());
+        }
+    }
+}
+
+void Analyzer::visit(b::ast::Identifier* node) { useName(node->name, node->loc); }
+
+void Analyzer::visit(b::ast::BinaryOp* node) {
+    if (node->op == b::ast::BinaryOp::Operator::ASSIGN) {
+
+        if (!dynamic_cast<b::ast::Identifier*>(node->left.get())) {
+            std::string root = borrowRoot(node->left.get());
+            if (Local* holder = findLocal(root)) {
+                if (holder->type.isSharedBorrow()) {
+                    error(node->loc, "cannot assign through '" + root +
+                                         "' because it is a shared borrow",
+                          "take it as '&mut " +
+                              b::ast::typeToString([&] {
+                                  b::ast::Type bare = holder->type;
+                                  bare.ownership = b::ast::Ownership::Value;
+                                  bare.pointerLevel = bare.pointerLevel > 0 ? bare.pointerLevel - 1 : 0;
+                                  return bare;
+                              }()) +
+                              "' if it needs to change");
+                }
+            }
+        }
+
+        bool targetOwns = false;
+        b::ast::Type placeType;
+        if (typeOf(node->left.get(), placeType) && placeType.isOwned()) {
+            targetOwns = true;
+        }
+        if (auto* target = dynamic_cast<b::ast::Identifier*>(node->left.get())) {
+            if (Local* local = findLocal(target->name)) {
+                targetOwns = targetOwns || local->type.isOwned();
+                if (targetOwns && local->moved) {
+                    local->moved = false;
+                }
+            }
+            assignName(target->name, target->loc);
+        } else {
+            walk(node->left.get());
+        }
+        if (targetOwns) {
+            consume(node->right.get(), "assignment");
+        } else {
+            walk(node->right.get());
+        }
+        if (auto* target = dynamic_cast<b::ast::Identifier*>(node->left.get())) {
+            if (Local* holder = findLocal(target->name)) {
+                if (holder->type.isBorrow()) {
+                    releaseBorrow(*holder);
+                    holder->borrowsFrom.clear();
+                    registerNamedBorrow(target->name, node->right.get());
+                }
+            }
+        }
+        return;
+    }
+    walk(node->left.get());
+    walk(node->right.get());
+}
+
+void Analyzer::visit(b::ast::UnaryOp* node) {
+    if (node->op == b::ast::UnaryOp::Operator::ADDRESS_OF) {
+        openBorrow(node);
+        if (auto* ident = dynamic_cast<b::ast::Identifier*>(node->operand.get())) {
+            if (Local* local = findLocal(ident->name)) {
+                local->read = true;
+                return;
+            }
+        }
+    }
+    walk(node->operand.get());
+}
+
+void Analyzer::visit(b::ast::CastExpr* node) { walk(node->expr.get()); }
+
+void Analyzer::visit(b::ast::FunctionCall* node) {
+    if (node->isIndirect()) {
+        walk(node->callee.get());
+    } else {
+        auto it = functions.find(node->functionName);
+        if (it != functions.end()) {
+            it->second.called = true;
+            if (node->arguments.size() != it->second.parameterCount) {
+                error(node->loc, "'" + node->functionName + "' expects " +
+                                     std::to_string(it->second.parameterCount) +
+                                     " argument(s) but got " +
+                                     std::to_string(node->arguments.size()));
+            }
+        } else if (!builtins.count(node->functionName) && !findLocal(node->functionName) &&
+                   !globals.count(node->functionName)) {
+            std::vector<std::string> names;
+            for (const auto& entry : functions) {
+                names.push_back(entry.first);
+            }
+            for (const auto& name : builtins) {
+                names.push_back(name);
+            }
+            std::string suggestion = b::diag::closestMatch(node->functionName, names);
+            error(node->loc, "cannot find function '" + node->functionName + "'",
+                  suggestion.empty() ? "" : "did you mean '" + suggestion + "'?");
+        } else if (Local* local = findLocal(node->functionName)) {
+            local->read = true;
+        }
+    }
+    auto signature = functions.find(node->functionName);
+    for (size_t i = 0; i < node->arguments.size(); ++i) {
+        bool consumesArgument = signature != functions.end() &&
+                                i < signature->second.parameterTypes.size() &&
+                                signature->second.parameterTypes[i].isOwned();
+        if (consumesArgument) {
+            consume(node->arguments[i].get(), "argument");
+        } else {
+            walk(node->arguments[i].get());
+        }
+    }
+}
+
+void Analyzer::visit(b::ast::MemberAccess* node) {
+    rejectOptionalAccess(node->object.get(), "reach '" + node->member + "' through");
+    walk(node->object.get());
+}
+
+void Analyzer::visit(b::ast::ArrayAccess* node) {
+    rejectOptionalAccess(node->array.get(), "index");
+    walk(node->array.get());
+    walk(node->index.get());
+}
+
+void Analyzer::rejectOptionalAccess(b::ast::Expression* target, const std::string& what) {
+    b::ast::Type targetType;
+    if (!typeOf(target, targetType) || !targetType.optional) {
+        return;
+    }
+    std::string root = borrowRoot(target);
+    error(target->loc,
+          "cannot " + what + " '" + b::ast::typeToString(targetType) +
+              "' without unwrapping it first",
+          root.empty() ? "wrap the access in 'if some (value = ...) { ... }'"
+                       : "write 'if some (value = " + root + ") { ... }' and use 'value' inside");
+}
+
+void Analyzer::visit(b::ast::VariableDecl* node) {
+    if (node->type.isOwned()) {
+        consume(node->initializer.get(), "initializer");
+    } else {
+        walk(node->initializer.get());
+    }
+    declareLocal(node->name, node->type, node->loc, false);
+    if (node->type.isBorrow() && node->initializer) {
+        registerNamedBorrow(node->name, node->initializer.get());
+    }
+}
+
+void Analyzer::visit(b::ast::ReturnStmt* node) {
+    if (currentReturnType.isOwned()) {
+        consume(node->value.get(), "return value");
+    } else {
+        walk(node->value.get());
+    }
+
+    if (currentReturnType.isBorrow() && node->value) {
+        std::string root = borrowRoot(node->value.get());
+        Local* source = root.empty() ? nullptr : findLocal(root);
+        if (source && !source->type.isBorrow()) {
+            error(node->loc, "cannot return a borrow of '" + root + "'",
+                  "'" + root + "' is released when this function returns, so the borrow would dangle");
+        }
+    }
+
+    pathTerminated = true;
+}
+
+void Analyzer::visit(b::ast::ExpressionStmt* node) { walk(node->expression.get()); }
+
+void Analyzer::visit(b::ast::Block* node) {
+    pushScope();
+    for (const auto& statement : node->statements) {
+        if (pathTerminated) {
+            break;
+        }
+        walk(statement.get());
+    }
+    popScope();
+}
+
+void Analyzer::visit(b::ast::IfSomeStmt* node) {
+    walk(node->source.get());
+
+    b::ast::Type bound;
+    std::string root = borrowRoot(node->source.get());
+    if (Local* holder = findLocal(root)) {
+        holder->read = true;
+    }
+    bound.base = b::ast::PrimitiveType::INT;
+    bound.pointerLevel = 1;
+    bound.ownership = node->mutableBinding ? b::ast::Ownership::MutBorrow
+                                           : b::ast::Ownership::SharedBorrow;
+    bound.structName = optionalPayloadStruct(node->source.get());
+    if (bound.structName.empty()) {
+        error(node->loc, "'if some' needs an optional value to unwrap",
+              "declare the value as 'own T?' or '&T?'");
+    }
+
+    MoveSnapshot beforeBranches = captureMoves();
+
+    pushScope();
+    declareLocal(node->binding, bound, node->loc, false);
+    pathTerminated = false;
+    walk(node->thenBranch.get());
+    bool thenLeft = pathTerminated;
+    popScope();
+    MoveSnapshot afterThen = captureMoves();
+
+    restoreMoves(beforeBranches);
+    pathTerminated = false;
+    walk(node->elseBranch.get());
+    bool elseLeft = pathTerminated;
+
+    if (!thenLeft) {
+        mergeMoves(afterThen);
+    }
+
+    pathTerminated = thenLeft && elseLeft && node->elseBranch != nullptr;
+}
+
+void Analyzer::visit(b::ast::IfStmt* node) {
+    walk(node->condition.get());
+
+    MoveSnapshot beforeBranches = captureMoves();
+
+    pathTerminated = false;
+    walk(node->thenBranch.get());
+    bool thenLeft = pathTerminated;
+    MoveSnapshot afterThen = captureMoves();
+
+    restoreMoves(beforeBranches);
+    pathTerminated = false;
+    walk(node->elseBranch.get());
+    bool elseLeft = pathTerminated;
+
+    if (!thenLeft) {
+        mergeMoves(afterThen);
+    }
+
+    pathTerminated = thenLeft && elseLeft && node->elseBranch != nullptr;
+}
+
+void Analyzer::visit(b::ast::ForStmt* node) {
+    pushScope();
+    walk(node->init.get());
+    walk(node->condition.get());
+    walk(node->increment.get());
+
+    MoveSnapshot beforeBody = captureMoves();
+    walk(node->body.get());
+    reportMovesInLoop(beforeBody);
+    pathTerminated = false;
+
+    popScope();
+}
+
+void Analyzer::visit(b::ast::WhileStmt* node) {
+    walk(node->condition.get());
+
+    MoveSnapshot beforeBody = captureMoves();
+    walk(node->body.get());
+    reportMovesInLoop(beforeBody);
+    pathTerminated = false;
+}
+
+void Analyzer::visit(b::ast::BreakStmt* node) {
+    (void)node;
+    pathTerminated = true;
+}
+
+void Analyzer::visit(b::ast::ContinueStmt* node) {
+    (void)node;
+    pathTerminated = true;
+}
+
+void Analyzer::visit(b::ast::SwitchStmt* node) {
+    walk(node->condition.get());
+
+    MoveSnapshot beforeCases = captureMoves();
+    MoveSnapshot combined = beforeCases;
+    for (const auto& caseItem : node->cases) {
+        restoreMoves(beforeCases);
+        walk(caseItem.value.get());
+        pushScope();
+        pathTerminated = false;
+        for (const auto& statement : caseItem.statements) {
+            if (pathTerminated) {
+                break;
+            }
+            walk(statement.get());
+        }
+        popScope();
+        pathTerminated = false;
+        MoveSnapshot afterCase = captureMoves();
+        restoreMoves(combined);
+        mergeMoves(afterCase);
+        combined = captureMoves();
+    }
+    restoreMoves(combined);
+}
+
+void Analyzer::visit(b::ast::StructDecl* node) { (void)node; }
+
+void Analyzer::visit(b::ast::FunctionDecl* node) {
+    currentFunction = node->name;
+    currentReturnType = node->returnType;
+    pathTerminated = false;
+    pushScope();
+    for (const auto& parameter : node->parameters) {
+        declareLocal(parameter.name, parameter.type, node->loc, true);
+    }
+    if (node->body) {
+
+        for (const auto& statement : node->body->statements) {
+            walk(statement.get());
+        }
+    }
+    popScope();
+    currentFunction.clear();
+}
+
+void Analyzer::visit(b::ast::Program* node) { (void)node; }
+
+void Analyzer::run(b::ast::Program* program) {
+    builtins = {"print",  "println", "printf", "scanf",  "sizeof", "len",
+                "strlen", "strcmp",  "strcpy", "atoi",   "itoa",   "sprintf",
+                "b_read", "b_write", "b_open", "b_close"};
+
+    for (const auto& strct : program->structs) {
+        structNames.insert(strct->name);
+        for (const auto& field : strct->fields) {
+            structFieldTypes[strct->name][field.name] = field.type;
+        }
+    }
+    for (const auto& enumDecl : program->enums) {
+        structNames.insert(enumDecl.name);
+        for (const auto& constant : enumDecl.constants) {
+            builtins.insert(constant.name);
+        }
+    }
+    for (const auto& typedefDecl : program->funcPointerTypedefs) {
+        structNames.insert(typedefDecl.name);
+    }
+    for (const auto& global : program->globalVariables) {
+        globals[global.name] = {global.type, global.loc, global.isPublic, false};
+    }
+    for (const auto& function : program->functions) {
+        FunctionInfo info;
+        info.declaredAt = function->loc;
+        info.isPublic = function->isPublic || !function->dropsType.empty();
+        info.parameterCount = function->parameters.size();
+        info.returnType = function->returnType;
+        for (const auto& parameter : function->parameters) {
+            info.parameterTypes.push_back(parameter.type);
+        }
+        functions[function->name] = std::move(info);
+    }
+
+    std::unordered_map<std::string, b::ast::SourceLocation> dropOwners;
+    for (const auto& function : program->functions) {
+        if (!function->dropsType.empty()) {
+            structsWithDrop.insert(function->dropsType);
+        }
+    }
+    for (const auto& function : program->functions) {
+        if (function->dropsType.empty()) {
+            continue;
+        }
+        if (!structNames.count(function->dropsType)) {
+            error(function->loc, "'drop " + function->dropsType + "' names '" + function->dropsType +
+                                     "', which is not a struct",
+                  b::diag::closestMatch(function->dropsType,
+                                        std::vector<std::string>(structNames.begin(), structNames.end()))
+                      .empty()
+                      ? ""
+                      : "did you mean '" +
+                            b::diag::closestMatch(
+                                function->dropsType,
+                                std::vector<std::string>(structNames.begin(), structNames.end())) +
+                            "'?");
+            continue;
+        }
+        auto existing = dropOwners.find(function->dropsType);
+        if (existing != dropOwners.end()) {
+            error(function->loc, "struct '" + function->dropsType + "' already has a drop function",
+                  "the first one is at line " + std::to_string(existing->second.line));
+            continue;
+        }
+        dropOwners[function->dropsType] = function->loc;
+    }
+
+    for (const auto& global : program->globalVariables) {
+        if (global.initializer) {
+            walk(global.initializer.get());
+        }
+    }
+    for (const auto& function : program->functions) {
+        function->accept(this);
+    }
+
+    for (const auto& function : program->functions) {
+        const FunctionInfo& info = functions[function->name];
+        if (info.called || info.isPublic || function->name == "main" || isIgnored(function->name)) {
+            continue;
+        }
+        error(info.declaredAt, "unused function '" + function->name + "'",
+              "call it, or mark it 'pub' if it is part of this module's public surface");
+    }
+
+    for (const auto& global : program->globalVariables) {
+        const GlobalInfo& info = globals[global.name];
+        if (info.read || info.isPublic || isIgnored(global.name)) {
+            continue;
+        }
+        error(info.declaredAt, "unused global '" + global.name + "'",
+              "remove it, or mark it 'pub' if it is part of this module's public surface");
+    }
+}
+
+}
+
 namespace b::codegen {
+
+int32_t parseIntLiteral(const std::string& text) {
+    long long value = 0;
+    try {
+        size_t consumed = 0;
+        value = std::stoll(text, &consumed);
+        if (consumed != text.size()) {
+            throw std::invalid_argument("trailing characters");
+        }
+    } catch (const std::exception&) {
+        throw b::CompilerException("'" + text + "' is not a valid integer literal");
+    }
+    if (value < INT32_MIN || value > INT32_MAX) {
+        throw b::CompilerException("Integer literal " + text +
+                                   " does not fit in 'int' (-2147483648 .. 2147483647)");
+    }
+    return static_cast<int32_t>(value);
+}
+
+llvm::ConstantInt* castConstantInt(llvm::ConstantInt* value, llvm::Type* target, bool isSigned) {
+    unsigned width = target->getIntegerBitWidth();
+    llvm::APInt bits = value->getValue();
+    return llvm::ConstantInt::get(target->getContext(),
+                                  isSigned ? bits.sextOrTrunc(width) : bits.zextOrTrunc(width));
+}
+
+double parseFloatLiteral(const std::string& text) {
+    try {
+        size_t consumed = 0;
+        double value = std::stod(text, &consumed);
+        if (consumed != text.size()) {
+            throw std::invalid_argument("trailing characters");
+        }
+        return value;
+    } catch (const std::exception&) {
+        throw b::CompilerException("'" + text + "' is not a valid floating-point literal");
+    }
+}
 
 class CodeGenerator : public b::ast::ASTVisitor {
 public:
@@ -2656,6 +4316,7 @@ public:
 
     bool generate(b::ast::Program* program, const std::string& outputPath);
     bool emitObject(const std::string& outputPath);
+    void optimize();
     bool linkExecutable(const std::string& objectFile, const std::string& executable);
 
 private:
@@ -2674,7 +4335,24 @@ private:
     std::unordered_map<std::string, std::vector<std::string>> structFields;
     std::unordered_map<std::string, std::unordered_map<std::string, b::ast::Type>> structFieldTypes;
     std::unordered_map<std::string, llvm::FunctionType*> funcPointerTypedefs;
+    std::unordered_map<std::string, b::ast::Type> funcPointerReturnTypes;
     std::unordered_set<std::string> constVariables;
+    std::unordered_set<std::string> constGlobals;
+    std::unordered_map<std::string, llvm::Constant*> constGlobalValues;
+
+    struct OwnedLocal {
+        std::string name;
+        std::string structName;
+        b::ast::Type type;
+        bool isSlice = false;
+        llvm::Value* slot = nullptr;
+        llvm::Value* flag = nullptr;
+    };
+    std::vector<std::vector<OwnedLocal>> ownedScopes;
+    std::unordered_map<std::string, llvm::Value*> dropFlags;
+    std::unordered_map<std::string, llvm::Function*> userDropFunctions;
+    std::unordered_map<std::string, llvm::Function*> dropGlueFunctions;
+    std::vector<size_t> loopOwnedDepth;
     std::unordered_map<std::string, llvm::GlobalVariable*> globalVariables;
     std::unordered_map<std::string, b::ast::Type> globalVariableTypes;
     std::unordered_map<std::string, b::ast::Type> functionReturnTypes;
@@ -2696,6 +4374,23 @@ private:
     b::ast::Type derefType(const b::ast::Type& type);
     llvm::FunctionType* createFunctionType(const b::ast::FunctionDecl* decl);
     void declareBuiltins();
+    void linkAllocatorRuntime();
+    llvm::AllocaInst* createEntryAlloca(llvm::Type* type, const std::string& name);
+    llvm::Constant* createStringConstant(const std::string& text);
+    llvm::Constant* evalConstantExpr(b::ast::Expression* expr, const std::string& where);
+    llvm::Value* emitPointerArithmetic(b::ast::BinaryOp* node, llvm::Value* lhs, llvm::Value* rhs,
+                                       const b::ast::Type& leftType, const b::ast::Type& rightType);
+    void emitShortCircuit(b::ast::BinaryOp* node);
+    void checkStructCycles(b::ast::Program* program);
+    llvm::Function* dropGlueFor(const std::string& structName);
+    static b::ast::Type elementTypeOf(const b::ast::Type& sliceType);
+    static bool assignableFrom(const b::ast::Type& target, const b::ast::Type& source);
+    void emitDrop(const OwnedLocal& local);
+    void emitSliceElementDrops(llvm::Value* slice, const b::ast::Type& sliceType);
+    void emitBoundsCheck(llvm::Value* index, llvm::Value* length);
+    void emitScopeDrops(size_t fromDepth);
+    void registerOwnedLocal(const std::string& name, const b::ast::Type& type, llvm::Value* slot,
+                            bool initialized);
     void pushScope();
     void popScope();
     void setVariable(const std::string& name, llvm::Value* value);
@@ -2708,6 +4403,8 @@ private:
 
     void visit(b::ast::Literal* node) override;
     void visit(b::ast::SizeofExpr* node) override;
+    void visit(b::ast::NewExpr* node) override;
+    void visit(b::ast::NewSliceExpr* node) override;
     void visit(b::ast::Identifier* node) override;
     void visit(b::ast::BinaryOp* node) override;
     void visit(b::ast::UnaryOp* node) override;
@@ -2720,6 +4417,7 @@ private:
     void visit(b::ast::ExpressionStmt* node) override;
     void visit(b::ast::Block* node) override;
     void visit(b::ast::IfStmt* node) override;
+    void visit(b::ast::IfSomeStmt* node) override;
     void visit(b::ast::ForStmt* node) override;
     void visit(b::ast::WhileStmt* node) override;
     void visit(b::ast::BreakStmt* node) override;
@@ -2751,6 +4449,7 @@ CodeGenerator::CodeGenerator()
     module->setTargetTriple(llvm::Triple(triple).str());
 #endif
     module->setDataLayout("e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128");
+    linkAllocatorRuntime();
     declareBuiltins();
 }
 
@@ -2775,7 +4474,27 @@ bool CodeGenerator::generate(b::ast::Program* program, const std::string& output
     }
 }
 
+void CodeGenerator::optimize() {
+    llvm::LoopAnalysisManager loopAnalyses;
+    llvm::FunctionAnalysisManager functionAnalyses;
+    llvm::CGSCCAnalysisManager cgsccAnalyses;
+    llvm::ModuleAnalysisManager moduleAnalyses;
+
+    llvm::PassBuilder builder;
+    builder.registerModuleAnalyses(moduleAnalyses);
+    builder.registerCGSCCAnalyses(cgsccAnalyses);
+    builder.registerFunctionAnalyses(functionAnalyses);
+    builder.registerLoopAnalyses(loopAnalyses);
+    builder.crossRegisterProxies(loopAnalyses, functionAnalyses, cgsccAnalyses, moduleAnalyses);
+
+    llvm::ModulePassManager passes =
+        builder.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
+    passes.run(*module, moduleAnalyses);
+}
+
 bool CodeGenerator::emitObject(const std::string& outputPath) {
+    optimize();
+
     std::string llFile = outputPath + ".ll";
     std::error_code ec;
     llvm::raw_fd_ostream llStream(llFile, ec);
@@ -2888,6 +4607,223 @@ llvm::FunctionType* CodeGenerator::createFunctionType(
     return llvm::FunctionType::get(returnType, paramTypes, false);
 }
 
+
+static const char* kAllocatorRuntimeIR = R"IR(
+@b_heap_cursor = internal global i64 0
+@b_heap_limit = internal global i64 0
+@b_free_lists = internal global [64 x i64] zeroinitializer
+@b_msg_bounds = internal constant [32 x i8] c"B: index out of range, aborting\0A"
+@b_msg_negative = internal constant [35 x i8] c"B: negative slice length, aborting\0A"
+
+define internal i64 @b_os_alloc(i64 %len) {
+  %r = call i64 asm sideeffect "syscall", "={ax},{ax},{di},{si},{dx},{r10},{r8},{r9},~{rcx},~{r11},~{memory},~{dirflag},~{fpsr},~{flags}"(i64 9, i64 0, i64 %len, i64 3, i64 34, i64 -1, i64 0)
+  ret i64 %r
+}
+
+define internal void @b_os_release(i64 %addr, i64 %len) {
+  %r = call i64 asm sideeffect "syscall", "={ax},{ax},{di},{si},~{rcx},~{r11},~{memory},~{dirflag},~{fpsr},~{flags}"(i64 11, i64 %addr, i64 %len)
+  ret void
+}
+
+define internal i64 @b_class_of(i64 %total) {
+entry:
+  br label %probe
+probe:
+  %k = phi i64 [ 5, %entry ], [ %next, %grow ]
+  %size = shl i64 1, %k
+  %fits = icmp uge i64 %size, %total
+  br i1 %fits, label %done, label %grow
+grow:
+  %next = add i64 %k, 1
+  br label %probe
+done:
+  ret i64 %k
+}
+
+define ptr @b_alloc(i64 %size) {
+entry:
+  %need = add i64 %size, 16
+  %k = call i64 @b_class_of(i64 %need)
+  %blocksize = shl i64 1, %k
+  %slot = getelementptr inbounds [64 x i64], ptr @b_free_lists, i64 0, i64 %k
+  %head = load i64, ptr %slot
+  %reusable = icmp ne i64 %head, 0
+  br i1 %reusable, label %reuse, label %bump
+
+reuse:
+  %headptr = inttoptr i64 %head to ptr
+  %linkslot = getelementptr inbounds i8, ptr %headptr, i64 8
+  %link = load i64, ptr %linkslot
+  store i64 %link, ptr %slot
+  br label %handout
+
+bump:
+  %cursor = load i64, ptr @b_heap_cursor
+  %limit = load i64, ptr @b_heap_limit
+  %after = add i64 %cursor, %blocksize
+  %roomy = icmp ule i64 %after, %limit
+  br i1 %roomy, label %carve, label %refill
+
+refill:
+  %huge = icmp ugt i64 %blocksize, 1048576
+  %chunk = select i1 %huge, i64 %blocksize, i64 1048576
+  %base = call i64 @b_os_alloc(i64 %chunk)
+  %failed = icmp ugt i64 %base, -4096
+  br i1 %failed, label %exhausted, label %adopt
+
+adopt:
+  %newlimit = add i64 %base, %chunk
+  store i64 %base, ptr @b_heap_cursor
+  store i64 %newlimit, ptr @b_heap_limit
+  br label %bump
+
+exhausted:
+  ret ptr null
+
+carve:
+  store i64 %after, ptr @b_heap_cursor
+  br label %handout
+
+handout:
+  %block = phi i64 [ %head, %reuse ], [ %cursor, %carve ]
+  %header = inttoptr i64 %block to ptr
+  store i64 %k, ptr %header
+  %payload = add i64 %block, 16
+  %result = inttoptr i64 %payload to ptr
+  ret ptr %result
+}
+
+define internal void @b_os_write(i64 %fd, ptr %buf, i64 %len) {
+  %addr = ptrtoint ptr %buf to i64
+  %r = call i64 asm sideeffect "syscall", "={ax},{ax},{di},{si},{dx},~{rcx},~{r11},~{memory},~{dirflag},~{fpsr},~{flags}"(i64 1, i64 %fd, i64 %addr, i64 %len)
+  ret void
+}
+
+define i64 @b_write(i64 %fd, ptr %buf, i64 %len) {
+  %addr = ptrtoint ptr %buf to i64
+  %r = call i64 asm sideeffect "syscall", "={ax},{ax},{di},{si},{dx},~{rcx},~{r11},~{memory},~{dirflag},~{fpsr},~{flags}"(i64 1, i64 %fd, i64 %addr, i64 %len)
+  ret i64 %r
+}
+
+define i64 @b_read(i64 %fd, ptr %buf, i64 %len) {
+  %addr = ptrtoint ptr %buf to i64
+  %r = call i64 asm sideeffect "syscall", "={ax},{ax},{di},{si},{dx},~{rcx},~{r11},~{memory},~{dirflag},~{fpsr},~{flags}"(i64 0, i64 %fd, i64 %addr, i64 %len)
+  ret i64 %r
+}
+
+define i64 @b_open(ptr %path, i64 %flags, i64 %mode) {
+  %addr = ptrtoint ptr %path to i64
+  %r = call i64 asm sideeffect "syscall", "={ax},{ax},{di},{si},{dx},~{rcx},~{r11},~{memory},~{dirflag},~{fpsr},~{flags}"(i64 2, i64 %addr, i64 %flags, i64 %mode)
+  ret i64 %r
+}
+
+define i64 @b_close(i64 %fd) {
+  %r = call i64 asm sideeffect "syscall", "={ax},{ax},{di},~{rcx},~{r11},~{memory},~{dirflag},~{fpsr},~{flags}"(i64 3, i64 %fd)
+  ret i64 %r
+}
+
+define void @b_panic(ptr %msg, i64 %len) noreturn {
+  call void @b_os_write(i64 2, ptr %msg, i64 %len)
+  %r = call i64 asm sideeffect "syscall", "={ax},{ax},{di},~{rcx},~{r11},~{memory},~{dirflag},~{fpsr},~{flags}"(i64 231, i64 134)
+  unreachable
+}
+
+define i64 @b_len(ptr %p) {
+entry:
+  %empty = icmp eq ptr %p, null
+  br i1 %empty, label %none, label %read
+none:
+  ret i64 0
+read:
+  %addr = ptrtoint ptr %p to i64
+  %slot = sub i64 %addr, 8
+  %slotptr = inttoptr i64 %slot to ptr
+  %count = load i64, ptr %slotptr
+  ret i64 %count
+}
+
+define ptr @b_alloc_array(i64 %elemSize, i64 %count) {
+entry:
+  %negative = icmp slt i64 %count, 0
+  br i1 %negative, label %bad, label %ok
+bad:
+  call void @b_panic(ptr @b_msg_negative, i64 35)
+  unreachable
+ok:
+  %bytes = mul i64 %elemSize, %count
+  %block = call ptr @b_alloc(i64 %bytes)
+  %missing = icmp eq ptr %block, null
+  br i1 %missing, label %oom, label %record
+oom:
+  ret ptr null
+record:
+  %addr = ptrtoint ptr %block to i64
+  %slot = sub i64 %addr, 8
+  %slotptr = inttoptr i64 %slot to ptr
+  store i64 %count, ptr %slotptr
+  br label %wipe
+wipe:
+  %i = phi i64 [ 0, %record ], [ %next, %step ]
+  %done = icmp uge i64 %i, %bytes
+  br i1 %done, label %finished, label %step
+step:
+  %cell = getelementptr inbounds i8, ptr %block, i64 %i
+  store i8 0, ptr %cell
+  %next = add i64 %i, 1
+  br label %wipe
+finished:
+  ret ptr %block
+}
+
+define void @b_bounds_check(i64 %index, i64 %len) {
+entry:
+  %below = icmp slt i64 %index, 0
+  %above = icmp sge i64 %index, %len
+  %bad = or i1 %below, %above
+  br i1 %bad, label %fail, label %ok
+fail:
+  call void @b_panic(ptr @b_msg_bounds, i64 32)
+  unreachable
+ok:
+  ret void
+}
+
+define void @b_free(ptr %p) {
+entry:
+  %empty = icmp eq ptr %p, null
+  br i1 %empty, label %done, label %recycle
+recycle:
+  %addr = ptrtoint ptr %p to i64
+  %block = sub i64 %addr, 16
+  %header = inttoptr i64 %block to ptr
+  %k = load i64, ptr %header
+  %slot = getelementptr inbounds [64 x i64], ptr @b_free_lists, i64 0, i64 %k
+  %head = load i64, ptr %slot
+  %linkslot = getelementptr inbounds i8, ptr %header, i64 8
+  store i64 %head, ptr %linkslot
+  store i64 %block, ptr %slot
+  br label %done
+done:
+  ret void
+}
+)IR";
+
+void CodeGenerator::linkAllocatorRuntime() {
+    llvm::SMDiagnostic parseError;
+    auto runtime = llvm::parseAssemblyString(kAllocatorRuntimeIR, parseError, *context);
+    if (!runtime) {
+        std::string detail;
+        llvm::raw_string_ostream stream(detail);
+        parseError.print("b-runtime", stream);
+        throw b::CompilerException("Internal error: allocator runtime failed to parse: " + detail);
+    }
+    runtime->setTargetTriple(module->getTargetTriple());
+    runtime->setDataLayout(module->getDataLayout());
+    if (llvm::Linker::linkModules(*module, std::move(runtime))) {
+        throw b::CompilerException("Internal error: allocator runtime failed to link");
+    }
+}
+
 void CodeGenerator::declareBuiltins() {
     llvm::Type* i8Ptr = llvm::PointerType::get(*context, 0);
     llvm::Type* i32 = llvm::Type::getInt32Ty(*context);
@@ -2908,54 +4844,11 @@ void CodeGenerator::declareBuiltins() {
                               "scanf", module.get());
     }
 
-    {
-        std::vector<llvm::Type*> args = {i8Ptr, i8Ptr};
-        auto funcType = llvm::FunctionType::get(i8Ptr, args, false);
-        llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
-                              "fopen", module.get());
-    }
 
-    {
-        std::vector<llvm::Type*> args = {i8Ptr};
-        auto funcType = llvm::FunctionType::get(i32, args, false);
-        llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
-                              "fclose", module.get());
-    }
 
-    {
-        std::vector<llvm::Type*> args = {i8Ptr, i64, i64, i8Ptr};
-        auto funcType = llvm::FunctionType::get(i64, args, false);
-        llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
-                              "fread", module.get());
-    }
 
-    {
-        std::vector<llvm::Type*> args = {i8Ptr, i64, i32};
-        auto funcType = llvm::FunctionType::get(i32, args, false);
-        llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
-                              "fseek", module.get());
-    }
 
-    {
-        std::vector<llvm::Type*> args = {i8Ptr};
-        auto funcType = llvm::FunctionType::get(i64, args, false);
-        llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
-                              "ftell", module.get());
-    }
 
-    {
-        std::vector<llvm::Type*> args = {i32};
-        auto funcType = llvm::FunctionType::get(i8Ptr, args, false);
-        llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
-                              "malloc", module.get());
-    }
-
-    {
-        std::vector<llvm::Type*> args = {i8Ptr};
-        auto funcType = llvm::FunctionType::get(voidTy, args, false);
-        llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
-                              "free", module.get());
-    }
 
     {
         std::vector<llvm::Type*> args = {i8Ptr};
@@ -2992,28 +4885,26 @@ void CodeGenerator::declareBuiltins() {
                               "sprintf", module.get());
     }
 
-    {
-        std::vector<llvm::Type*> args = {i8Ptr, i8Ptr};
-        auto funcType = llvm::FunctionType::get(i32, args, true);
-        llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
-                              "fprintf", module.get());
-    }
 
-    {
-        std::vector<llvm::Type*> args = {i8Ptr, i64, i64, i8Ptr};
-        auto funcType = llvm::FunctionType::get(i64, args, false);
-        llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
-                              "fwrite", module.get());
-    }
 
-    {
-        std::vector<llvm::Type*> args = {i8Ptr, i32, i8Ptr};
-        auto funcType = llvm::FunctionType::get(i8Ptr, args, false);
-        llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
-                              "fgets", module.get());
-    }
 
-    structTypes["FILE"] = llvm::StructType::create(*context, "FILE");
+}
+
+llvm::AllocaInst* CodeGenerator::createEntryAlloca(llvm::Type* type, const std::string& name) {
+    if (!currentFunction) {
+        throw b::CompilerException("Cannot declare '" + name + "' outside of a function");
+    }
+    llvm::BasicBlock& entry = currentFunction->getEntryBlock();
+    llvm::IRBuilder<> entryBuilder(&entry, entry.getFirstInsertionPt());
+    return entryBuilder.CreateAlloca(type, nullptr, name);
+}
+
+llvm::Constant* CodeGenerator::createStringConstant(const std::string& text) {
+    llvm::Constant* data = llvm::ConstantDataArray::getString(*context, text, true);
+    auto* gv = new llvm::GlobalVariable(*module, data->getType(), true,
+                                        llvm::GlobalValue::PrivateLinkage, data, ".str");
+    gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+    return gv;
 }
 
 bool CodeGenerator::blockIsTerminated() {
@@ -3078,56 +4969,17 @@ std::string CodeGenerator::enumTypeOf(b::ast::Expression* expr) {
         return literal->enumName;
     }
 
-    if (auto* ident = dynamic_cast<b::ast::Identifier*>(expr)) {
-        auto it = arcVariableTypes.find(ident->name);
-        if (it != arcVariableTypes.end() && it->second.isEnum()) {
-            return it->second.enumName;
-        }
-        return "";
-    }
-
-    if (auto* cast = dynamic_cast<b::ast::CastExpr*>(expr)) {
-        return cast->targetType.isEnum() ? cast->targetType.enumName : "";
-    }
-
-    if (auto* call = dynamic_cast<b::ast::FunctionCall*>(expr)) {
-        auto it = functionReturnTypes.find(call->functionName);
-        if (it != functionReturnTypes.end() && it->second.isEnum()) {
-            return it->second.enumName;
-        }
-        return "";
-    }
-
-    if (auto* member = dynamic_cast<b::ast::MemberAccess*>(expr)) {
-        auto* object = dynamic_cast<b::ast::Identifier*>(member->object.get());
-        if (!object) {
-            return "";
-        }
-        auto objectIt = arcVariableTypes.find(object->name);
-        if (objectIt == arcVariableTypes.end()) {
-            return "";
-        }
-        std::string structName = objectIt->second.structName;
-        if (structName.empty()) {
-            return "";
-        }
-        auto structIt = structFieldTypes.find(structName);
-        if (structIt == structFieldTypes.end()) {
-            return "";
-        }
-        auto fieldIt = structIt->second.find(member->member);
-        if (fieldIt == structIt->second.end() || !fieldIt->second.isEnum()) {
-            return "";
-        }
-        return fieldIt->second.enumName;
-    }
-
     if (auto* binary = dynamic_cast<b::ast::BinaryOp*>(expr)) {
         if (binary->op == b::ast::BinaryOp::Operator::ASSIGN) {
             return enumTypeOf(binary->left.get());
         }
+        return "";
     }
 
+    b::ast::Type resolved;
+    if (inferType(expr, resolved) && resolved.isEnum()) {
+        return resolved.enumName;
+    }
     return "";
 }
 
@@ -3181,6 +5033,114 @@ void CodeGenerator::checkEnumOperands(b::ast::BinaryOp* node) {
     }
 }
 
+llvm::Constant* CodeGenerator::evalConstantExpr(b::ast::Expression* expr,
+                                                const std::string& where) {
+    if (auto* literal = dynamic_cast<b::ast::Literal*>(expr)) {
+        switch (literal->kind) {
+            case b::ast::Literal::Kind::INTEGER:
+                return llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context),
+                                              parseIntLiteral(literal->value), true);
+            case b::ast::Literal::Kind::FLOAT:
+                return llvm::ConstantFP::get(llvm::Type::getDoubleTy(*context),
+                                             parseFloatLiteral(literal->value));
+            case b::ast::Literal::Kind::BOOLEAN:
+                return llvm::ConstantInt::get(llvm::Type::getInt1Ty(*context),
+                                              literal->value == "true");
+            case b::ast::Literal::Kind::STRING:
+                return createStringConstant(literal->value);
+        }
+    }
+
+    if (auto* ident = dynamic_cast<b::ast::Identifier*>(expr)) {
+        auto it = constGlobalValues.find(ident->name);
+        if (it != constGlobalValues.end()) {
+            return it->second;
+        }
+        if (globalVariables.count(ident->name)) {
+            throw b::CompilerException("'" + ident->name + "' is not const, so it cannot be used in " +
+                                       where + "; declare it as 'const'");
+        }
+        throw b::CompilerException("'" + ident->name + "' is not a constant known at compile time, " +
+                                   "so it cannot be used in " + where);
+    }
+
+    if (auto* sizeExpr = dynamic_cast<b::ast::SizeofExpr*>(expr)) {
+        llvm::Type* type = arcTypeToLLVM(sizeExpr->targetType);
+        if (sizeExpr->targetType.isVoid() || !type->isSized()) {
+            throw b::CompilerException("sizeof is not allowed on this type in " + where);
+        }
+        return llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context),
+                                      module->getDataLayout().getTypeAllocSize(type));
+    }
+
+    if (auto* unary = dynamic_cast<b::ast::UnaryOp*>(expr)) {
+        llvm::Constant* operand = evalConstantExpr(unary->operand.get(), where);
+        switch (unary->op) {
+            case b::ast::UnaryOp::Operator::NEGATE:
+                if (auto* asFloat = llvm::dyn_cast<llvm::ConstantFP>(operand)) {
+                    return llvm::ConstantFP::get(asFloat->getType(),
+                                                 -asFloat->getValueAPF().convertToDouble());
+                }
+                return llvm::ConstantExpr::getNeg(operand);
+            case b::ast::UnaryOp::Operator::BITWISE_NOT:
+                return llvm::ConstantExpr::getNot(operand);
+            default:
+                break;
+        }
+    }
+
+    if (auto* binary = dynamic_cast<b::ast::BinaryOp*>(expr)) {
+        llvm::Constant* lhs = evalConstantExpr(binary->left.get(), where);
+        llvm::Constant* rhs = evalConstantExpr(binary->right.get(), where);
+        if (lhs->getType()->isIntegerTy() && rhs->getType()->isIntegerTy()) {
+            auto* left = llvm::dyn_cast<llvm::ConstantInt>(lhs);
+            auto* right = llvm::dyn_cast<llvm::ConstantInt>(rhs);
+            if (left && right) {
+                int64_t a = left->getSExtValue();
+                int64_t b = right->getSExtValue();
+                int64_t result = 0;
+                switch (binary->op) {
+                    case b::ast::BinaryOp::Operator::PLUS:     result = a + b; break;
+                    case b::ast::BinaryOp::Operator::MINUS:    result = a - b; break;
+                    case b::ast::BinaryOp::Operator::MULTIPLY: result = a * b; break;
+                    case b::ast::BinaryOp::Operator::DIVIDE:
+                    case b::ast::BinaryOp::Operator::MODULO:
+                        if (b == 0) {
+                            throw b::CompilerException("Division by zero in " + where);
+                        }
+                        result = binary->op == b::ast::BinaryOp::Operator::DIVIDE ? a / b : a % b;
+                        break;
+                    case b::ast::BinaryOp::Operator::SHIFT_LEFT:  result = a << b; break;
+                    case b::ast::BinaryOp::Operator::SHIFT_RIGHT: result = a >> b; break;
+                    case b::ast::BinaryOp::Operator::BITWISE_AND: result = a & b; break;
+                    case b::ast::BinaryOp::Operator::BITWISE_OR:  result = a | b; break;
+                    case b::ast::BinaryOp::Operator::BITWISE_XOR: result = a ^ b; break;
+                    default:
+                        throw b::CompilerException(
+                            "This operator is not allowed in " + where +
+                            "; global initializers must be compile-time constants");
+                }
+                return llvm::ConstantInt::get(lhs->getType(), result, true);
+            }
+        }
+    }
+
+    if (auto* cast = dynamic_cast<b::ast::CastExpr*>(expr)) {
+        llvm::Constant* value = evalConstantExpr(cast->expr.get(), where);
+        llvm::Type* target = arcTypeToLLVM(cast->targetType);
+        if (value->getType() == target) {
+            return value;
+        }
+        if (value->getType()->isIntegerTy() && target->isIntegerTy()) {
+            return castConstantInt(llvm::cast<llvm::ConstantInt>(value), target,
+                                   !value->getType()->isIntegerTy(1));
+        }
+    }
+
+    throw b::CompilerException(
+        where + " must be a compile-time constant; call the function from inside main() instead");
+}
+
 void CodeGenerator::visit(b::ast::SizeofExpr* node) {
     llvm::Type* type = arcTypeToLLVM(node->targetType);
     if (node->targetType.isVoid()) {
@@ -3196,16 +5156,320 @@ void CodeGenerator::visit(b::ast::SizeofExpr* node) {
                                        static_cast<uint32_t>(size));
 }
 
+
+llvm::Function* CodeGenerator::dropGlueFor(const std::string& structName) {
+    auto existing = dropGlueFunctions.find(structName);
+    if (existing != dropGlueFunctions.end()) {
+        return existing->second;
+    }
+
+    llvm::Type* ptrType = llvm::PointerType::get(*context, 0);
+    llvm::FunctionType* glueType =
+        llvm::FunctionType::get(llvm::Type::getVoidTy(*context), {ptrType}, false);
+    llvm::Function* glue = llvm::Function::Create(glueType, llvm::Function::InternalLinkage,
+                                                  "drop.glue." + structName, module.get());
+    dropGlueFunctions[structName] = glue;
+
+    llvm::BasicBlock* savedBlock = builder->GetInsertBlock();
+    llvm::BasicBlock::iterator savedPoint;
+    if (savedBlock) {
+        savedPoint = builder->GetInsertPoint();
+    }
+
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(*context, "entry", glue);
+    builder->SetInsertPoint(entry);
+    llvm::Value* target = &*glue->arg_begin();
+
+    auto userDrop = userDropFunctions.find(structName);
+    if (userDrop != userDropFunctions.end()) {
+        builder->CreateCall(userDrop->second, {target});
+    }
+
+    auto namesIt = structFields.find(structName);
+    auto typesIt = structFieldTypes.find(structName);
+    auto structIt = structTypes.find(structName);
+    if (namesIt != structFields.end() && typesIt != structFieldTypes.end() &&
+        structIt != structTypes.end()) {
+        for (size_t i = 0; i < namesIt->second.size(); ++i) {
+            const b::ast::Type& fieldType = typesIt->second[namesIt->second[i]];
+            if (!fieldType.isOwned()) {
+                continue;
+            }
+            llvm::Value* slot =
+                builder->CreateStructGEP(structIt->second, target, static_cast<unsigned>(i));
+            llvm::Value* owned = builder->CreateLoad(ptrType, slot);
+            llvm::Value* present = builder->CreateICmpNE(
+                owned, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrType)));
+
+            llvm::BasicBlock* release = llvm::BasicBlock::Create(*context, "drop.field", glue);
+            llvm::BasicBlock* skip = llvm::BasicBlock::Create(*context, "drop.skip", glue);
+            builder->CreateCondBr(present, release, skip);
+
+            builder->SetInsertPoint(release);
+            if (fieldType.slice) {
+                emitSliceElementDrops(owned, fieldType);
+            } else {
+                builder->CreateCall(dropGlueFor(fieldType.structName), {owned});
+            }
+            builder->CreateCall(module->getFunction("b_free"), {owned});
+            builder->CreateBr(skip);
+
+            builder->SetInsertPoint(skip);
+        }
+    }
+
+    builder->CreateRetVoid();
+
+    if (savedBlock) {
+        builder->SetInsertPoint(savedBlock, savedPoint);
+    } else {
+        builder->ClearInsertionPoint();
+    }
+    return glue;
+}
+
+void CodeGenerator::emitBoundsCheck(llvm::Value* index, llvm::Value* length) {
+    llvm::Function* host = builder->GetInsertBlock()->getParent();
+    llvm::Value* inRange = builder->CreateICmpULT(index, length);
+
+    llvm::BasicBlock* fail = llvm::BasicBlock::Create(*context, "index.fail", host);
+    llvm::BasicBlock* proceed = llvm::BasicBlock::Create(*context, "index.ok", host);
+
+    llvm::MDBuilder metadata(*context);
+    llvm::BranchInst* branch = builder->CreateCondBr(inRange, proceed, fail);
+    branch->setMetadata(llvm::LLVMContext::MD_prof, metadata.createBranchWeights(2000, 1));
+
+    builder->SetInsertPoint(fail);
+    llvm::Function* panic = module->getFunction("b_panic");
+    llvm::GlobalVariable* message = module->getGlobalVariable("b_msg_bounds", true);
+    builder->CreateCall(panic, {message, llvm::ConstantInt::get(
+                                             llvm::Type::getInt64Ty(*context), 32)});
+    builder->CreateUnreachable();
+
+    builder->SetInsertPoint(proceed);
+}
+
+void CodeGenerator::emitSliceElementDrops(llvm::Value* slice, const b::ast::Type& sliceType) {
+    b::ast::Type element = elementTypeOf(sliceType);
+    bool ownedElements = element.isOwned();
+    if (!ownedElements && element.structName.empty()) {
+        return;
+    }
+    if (!ownedElements && !structTypes.count(element.structName)) {
+        return;
+    }
+    llvm::Type* elementType = arcTypeToLLVM(element);
+
+    llvm::Type* countType = llvm::Type::getInt64Ty(*context);
+    llvm::Value* count = builder->CreateCall(module->getFunction("b_len"), {slice});
+
+    llvm::Function* host = builder->GetInsertBlock()->getParent();
+    llvm::BasicBlock& hostEntry = host->getEntryBlock();
+    llvm::IRBuilder<> entryBuilder(&hostEntry, hostEntry.getFirstInsertionPt());
+    llvm::Value* cursor = entryBuilder.CreateAlloca(countType, nullptr, "slice.i");
+    builder->CreateStore(llvm::ConstantInt::get(countType, 0), cursor);
+
+    llvm::BasicBlock* test = llvm::BasicBlock::Create(*context, "slice.test", host);
+    llvm::BasicBlock* body = llvm::BasicBlock::Create(*context, "slice.body", host);
+    llvm::BasicBlock* done = llvm::BasicBlock::Create(*context, "slice.done", host);
+
+    builder->CreateBr(test);
+    builder->SetInsertPoint(test);
+    llvm::Value* index = builder->CreateLoad(countType, cursor);
+    builder->CreateCondBr(builder->CreateICmpULT(index, count), body, done);
+
+    builder->SetInsertPoint(body);
+    llvm::Value* slot = builder->CreateGEP(elementType, slice, index);
+    if (ownedElements) {
+        llvm::Type* ptrType = llvm::PointerType::get(*context, 0);
+        llvm::Value* held = builder->CreateLoad(ptrType, slot);
+        llvm::Value* present = builder->CreateICmpNE(
+            held, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrType)));
+        llvm::BasicBlock* release = llvm::BasicBlock::Create(*context, "slice.item", host);
+        llvm::BasicBlock* skip = llvm::BasicBlock::Create(*context, "slice.skip", host);
+        builder->CreateCondBr(present, release, skip);
+        builder->SetInsertPoint(release);
+        if (!element.structName.empty()) {
+            builder->CreateCall(dropGlueFor(element.structName), {held});
+        }
+        builder->CreateCall(module->getFunction("b_free"), {held});
+        builder->CreateBr(skip);
+        builder->SetInsertPoint(skip);
+    } else {
+        builder->CreateCall(dropGlueFor(element.structName), {slot});
+    }
+    builder->CreateStore(builder->CreateAdd(index, llvm::ConstantInt::get(countType, 1)), cursor);
+    builder->CreateBr(test);
+
+    builder->SetInsertPoint(done);
+}
+
+void CodeGenerator::emitDrop(const OwnedLocal& local) {
+    llvm::Type* ptrType = llvm::PointerType::get(*context, 0);
+    llvm::Type* boolType = llvm::Type::getInt1Ty(*context);
+
+    llvm::Value* live = builder->CreateLoad(boolType, local.flag);
+    llvm::BasicBlock* release = llvm::BasicBlock::Create(*context, "drop.live", currentFunction);
+    llvm::BasicBlock* after = llvm::BasicBlock::Create(*context, "drop.done", currentFunction);
+    builder->CreateCondBr(live, release, after);
+
+    builder->SetInsertPoint(release);
+    llvm::Value* value = builder->CreateLoad(ptrType, local.slot);
+    if (local.isSlice) {
+        emitSliceElementDrops(value, local.type);
+    } else {
+        builder->CreateCall(dropGlueFor(local.structName), {value});
+    }
+    builder->CreateCall(module->getFunction("b_free"), {value});
+    builder->CreateStore(llvm::ConstantInt::getFalse(*context), local.flag);
+    builder->CreateBr(after);
+
+    builder->SetInsertPoint(after);
+}
+
+void CodeGenerator::emitScopeDrops(size_t fromDepth) {
+    for (size_t depth = ownedScopes.size(); depth > fromDepth; --depth) {
+        const auto& scope = ownedScopes[depth - 1];
+        for (auto local = scope.rbegin(); local != scope.rend(); ++local) {
+            if (blockIsTerminated()) {
+                return;
+            }
+            emitDrop(*local);
+        }
+    }
+}
+
+void CodeGenerator::registerOwnedLocal(const std::string& name, const b::ast::Type& type,
+                                       llvm::Value* slot, bool initialized) {
+    llvm::BasicBlock& entry = currentFunction->getEntryBlock();
+    llvm::IRBuilder<> entryBuilder(&entry, entry.getFirstInsertionPt());
+    llvm::Value* flag =
+        entryBuilder.CreateAlloca(llvm::Type::getInt1Ty(*context), nullptr, name + ".live");
+    entryBuilder.CreateStore(llvm::ConstantInt::getFalse(*context), flag);
+    if (initialized) {
+        builder->CreateStore(llvm::ConstantInt::getTrue(*context), flag);
+    }
+    dropFlags[name] = flag;
+    if (!ownedScopes.empty()) {
+        ownedScopes.back().push_back({name, type.structName, type, type.slice, slot, flag});
+    }
+}
+
+bool CodeGenerator::assignableFrom(const b::ast::Type& target, const b::ast::Type& source) {
+    if (target.slice != source.slice) {
+        return false;
+    }
+    if (!target.slice) {
+        return true;
+    }
+    if (b::ast::typeToString(elementTypeOf(target)) !=
+        b::ast::typeToString(elementTypeOf(source))) {
+        return false;
+    }
+    if (target.fixedLength >= 0 && target.fixedLength != source.fixedLength) {
+        return false;
+    }
+    return true;
+}
+
+b::ast::Type CodeGenerator::elementTypeOf(const b::ast::Type& sliceType) {
+    b::ast::Type element = sliceType;
+    bool holdsOwned = sliceType.ownedElements;
+    element.slice = false;
+    element.ownedElements = false;
+    element.fixedLength = -1;
+    element.optional = false;
+    element.ownership = holdsOwned ? b::ast::Ownership::Owned : b::ast::Ownership::Value;
+    element.pointerLevel = holdsOwned ? 1 : 0;
+    return element;
+}
+
+void CodeGenerator::visit(b::ast::NewSliceExpr* node) {
+    b::ast::Type element = elementTypeOf(node->type);
+    llvm::Type* elementType = arcTypeToLLVM(element);
+    if (!elementType->isSized()) {
+        throw b::CompilerException("Cannot allocate a slice of '" +
+                                   b::ast::typeToString(element) + "'");
+    }
+
+    node->count->accept(this);
+    llvm::Value* count = builder->CreateIntCast(lastValue, llvm::Type::getInt64Ty(*context), true);
+
+    uint64_t stride = module->getDataLayout().getTypeAllocSize(elementType);
+    llvm::Function* allocator = module->getFunction("b_alloc_array");
+    if (!allocator) {
+        throw b::CompilerException("Internal error: allocator runtime is missing");
+    }
+    lastValue = builder->CreateCall(
+        allocator, {llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context), stride), count});
+}
+
+void CodeGenerator::visit(b::ast::NewExpr* node) {
+    b::ast::Type valueType = node->type;
+    valueType.pointerLevel = 0;
+    valueType.ownership = b::ast::Ownership::Value;
+
+    llvm::Type* structType = arcTypeToLLVM(valueType);
+    if (!structType->isSized()) {
+        throw b::CompilerException("Cannot allocate an incomplete type '" +
+                                   b::ast::typeToString(valueType) + "'");
+    }
+
+    llvm::Function* allocator = module->getFunction("b_alloc");
+    if (!allocator) {
+        throw b::CompilerException("Internal error: allocator runtime is missing");
+    }
+
+    uint64_t size = module->getDataLayout().getTypeAllocSize(structType);
+    llvm::Value* storage = builder->CreateCall(
+        allocator, {llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context), size)});
+    builder->CreateStore(llvm::Constant::getNullValue(structType), storage);
+
+    auto namesIt = structFields.find(valueType.structName);
+    auto typesIt = structFieldTypes.find(valueType.structName);
+    if (namesIt == structFields.end() || typesIt == structFieldTypes.end()) {
+        throw b::CompilerException("Unknown struct type '" + valueType.structName + "'");
+    }
+
+    std::unordered_set<std::string> initialized;
+    for (const auto& field : node->fields) {
+        if (!initialized.insert(field.first).second) {
+            throw b::CompilerException("Field '" + field.first + "' is initialized twice in 'new " +
+                                       valueType.structName + "'");
+        }
+        size_t index = namesIt->second.size();
+        for (size_t i = 0; i < namesIt->second.size(); ++i) {
+            if (namesIt->second[i] == field.first) {
+                index = i;
+                break;
+            }
+        }
+        if (index == namesIt->second.size()) {
+            throw b::CompilerException("Struct '" + valueType.structName + "' has no field '" +
+                                       field.first + "'");
+        }
+
+        field.second->accept(this);
+        llvm::Value* value = lastValue;
+        llvm::Value* slot = builder->CreateStructGEP(
+            llvm::cast<llvm::StructType>(structType), storage, static_cast<unsigned>(index));
+        builder->CreateStore(coerceValue(value, arcTypeToLLVM(typesIt->second[field.first])), slot);
+    }
+
+    lastValue = storage;
+}
+
 void CodeGenerator::visit(b::ast::Literal* node) {
     switch (node->kind) {
         case b::ast::Literal::Kind::INTEGER: {
-            int value = std::stoi(node->value);
-            lastValue = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), value);
+            lastValue = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context),
+                                               parseIntLiteral(node->value), true);
             break;
         }
         case b::ast::Literal::Kind::FLOAT: {
-            float value = std::stof(node->value);
-            lastValue = llvm::ConstantFP::get(llvm::Type::getFloatTy(*context), value);
+
+            lastValue = llvm::ConstantFP::get(llvm::Type::getDoubleTy(*context),
+                                              parseFloatLiteral(node->value));
             break;
         }
         case b::ast::Literal::Kind::STRING: {
@@ -3217,23 +5481,24 @@ void CodeGenerator::visit(b::ast::Literal* node) {
             lastValue = llvm::ConstantInt::get(llvm::Type::getInt1Ty(*context), value);
             break;
         }
+        case b::ast::Literal::Kind::NONE: {
+            lastValue = llvm::ConstantPointerNull::get(
+                llvm::cast<llvm::PointerType>(llvm::PointerType::get(*context, 0)));
+            break;
+        }
     }
 }
 
 void CodeGenerator::visit(b::ast::Identifier* node) {
-    auto globalIt = globalVariables.find(node->name);
-    if (globalIt != globalVariables.end()) {
-        llvm::GlobalVariable* gv = globalIt->second;
-        auto typeIt = variableTypes.find(node->name);
-        if (typeIt != variableTypes.end()) {
-            lastValue = builder->CreateLoad(typeIt->second, gv);
-        } else {
-            lastValue = builder->CreateLoad(gv->getValueType(), gv);
-        }
-        return;
-    }
 
     if (variables.find(node->name) == variables.end()) {
+        auto globalIt = globalVariables.find(node->name);
+        if (globalIt != globalVariables.end()) {
+            llvm::GlobalVariable* gv = globalIt->second;
+            lastValue = builder->CreateLoad(gv->getValueType(), gv);
+            return;
+        }
+
         llvm::Function* func = module->getFunction(node->name);
         if (func) {
             lastValue = func;
@@ -3248,6 +5513,95 @@ void CodeGenerator::visit(b::ast::Identifier* node) {
     } else {
         lastValue = varPtr;
     }
+
+    if (node->isMoveSource) {
+        auto flagIt = dropFlags.find(node->name);
+        if (flagIt != dropFlags.end()) {
+            builder->CreateStore(llvm::ConstantInt::getFalse(*context), flagIt->second);
+        }
+    }
+}
+
+void CodeGenerator::emitShortCircuit(b::ast::BinaryOp* node) {
+    bool isAnd = node->op == b::ast::BinaryOp::Operator::LOGICAL_AND;
+
+    node->left->accept(this);
+    llvm::Value* lhs = toBoolCondition(lastValue);
+    llvm::BasicBlock* entryBlock = builder->GetInsertBlock();
+
+    llvm::BasicBlock* rhsBlock =
+        llvm::BasicBlock::Create(*context, isAnd ? "and.rhs" : "or.rhs", currentFunction);
+    llvm::BasicBlock* endBlock =
+        llvm::BasicBlock::Create(*context, isAnd ? "and.end" : "or.end", currentFunction);
+
+    if (isAnd) {
+        builder->CreateCondBr(lhs, rhsBlock, endBlock);
+    } else {
+        builder->CreateCondBr(lhs, endBlock, rhsBlock);
+    }
+
+    builder->SetInsertPoint(rhsBlock);
+    node->right->accept(this);
+    llvm::Value* rhs = toBoolCondition(lastValue);
+
+    llvm::BasicBlock* rhsExit = builder->GetInsertBlock();
+    builder->CreateBr(endBlock);
+
+    builder->SetInsertPoint(endBlock);
+    llvm::PHINode* phi = builder->CreatePHI(llvm::Type::getInt1Ty(*context), 2);
+    phi->addIncoming(llvm::ConstantInt::get(llvm::Type::getInt1Ty(*context), isAnd ? 0 : 1),
+                     entryBlock);
+    phi->addIncoming(rhs, rhsExit);
+    lastValue = phi;
+}
+
+llvm::Value* CodeGenerator::emitPointerArithmetic(b::ast::BinaryOp* node, llvm::Value* lhs,
+                                                  llvm::Value* rhs,
+                                                  const b::ast::Type& leftType,
+                                                  const b::ast::Type& rightType) {
+    bool leftIsPointer = lhs->getType()->isPointerTy();
+    bool rightIsPointer = rhs->getType()->isPointerTy();
+    bool subtract = node->op == b::ast::BinaryOp::Operator::MINUS;
+
+    if (leftIsPointer && rightIsPointer) {
+        if (!subtract) {
+            throw b::CompilerException("Two pointers cannot be added; only p - q is defined");
+        }
+        if (leftType.pointerLevel != rightType.pointerLevel ||
+            b::ast::typeToString(derefType(leftType)) != b::ast::typeToString(derefType(rightType))) {
+            throw b::CompilerException("Cannot subtract '" + b::ast::typeToString(rightType) +
+                                       "' from '" + b::ast::typeToString(leftType) + "'");
+        }
+        llvm::Type* elementType = arcTypeToLLVM(derefType(leftType));
+        if (!elementType->isSized()) {
+            throw b::CompilerException("Cannot do pointer arithmetic on an incomplete type");
+        }
+
+        return builder->CreateIntCast(builder->CreatePtrDiff(elementType, lhs, rhs),
+                                      llvm::Type::getInt32Ty(*context), true);
+    }
+
+    llvm::Value* pointer = leftIsPointer ? lhs : rhs;
+    llvm::Value* offset = leftIsPointer ? rhs : lhs;
+    const b::ast::Type& pointerType = leftIsPointer ? leftType : rightType;
+
+    if (!offset->getType()->isIntegerTy()) {
+        throw b::CompilerException("A pointer can only be offset by an integer");
+    }
+    if (subtract && !leftIsPointer) {
+        throw b::CompilerException("Cannot subtract a pointer from an integer");
+    }
+
+    llvm::Type* elementType = arcTypeToLLVM(derefType(pointerType));
+    if (!elementType->isSized()) {
+        throw b::CompilerException("Cannot do pointer arithmetic on an incomplete type");
+    }
+
+    offset = builder->CreateIntCast(offset, llvm::Type::getInt64Ty(*context), true);
+    if (subtract) {
+        offset = builder->CreateNeg(offset);
+    }
+    return builder->CreateGEP(elementType, pointer, offset);
 }
 
 void CodeGenerator::visit(b::ast::BinaryOp* node) {
@@ -3278,7 +5632,60 @@ void CodeGenerator::visit(b::ast::BinaryOp* node) {
 
         b::ast::Type targetType;
         llvm::Value* targetPtr = addressOf(node->left.get(), &targetType);
-        rhsValue = coerceValue(rhsValue, arcTypeToLLVM(targetType));
+        llvm::Type* wantedType = arcTypeToLLVM(targetType);
+        b::ast::Type sourceType;
+        if (inferType(node->right.get(), sourceType) && !assignableFrom(targetType, sourceType)) {
+            throw b::CompilerException("Cannot assign '" + b::ast::typeToString(sourceType) +
+                                       "' to '" + b::ast::typeToString(targetType) + "'");
+        }
+        rhsValue = coerceValue(rhsValue, wantedType);
+        if (rhsValue->getType() != wantedType) {
+            throw b::CompilerException("Cannot assign this value to a target of type '" +
+                                       b::ast::typeToString(targetType) + "'");
+        }
+
+        if (targetType.isOwned() && !dynamic_cast<b::ast::Identifier*>(node->left.get())) {
+            llvm::Type* ptrType = llvm::PointerType::get(*context, 0);
+            llvm::Value* previous = builder->CreateLoad(ptrType, targetPtr);
+            llvm::Value* occupied = builder->CreateICmpNE(
+                previous, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrType)));
+            llvm::BasicBlock* release =
+                llvm::BasicBlock::Create(*context, "field.drop", currentFunction);
+            llvm::BasicBlock* after =
+                llvm::BasicBlock::Create(*context, "field.set", currentFunction);
+            builder->CreateCondBr(occupied, release, after);
+            builder->SetInsertPoint(release);
+            if (targetType.slice) {
+                emitSliceElementDrops(previous, targetType);
+            } else {
+                builder->CreateCall(dropGlueFor(targetType.structName), {previous});
+            }
+            builder->CreateCall(module->getFunction("b_free"), {previous});
+            builder->CreateBr(after);
+            builder->SetInsertPoint(after);
+        }
+
+        if (targetType.isOwned()) {
+            if (auto* target = dynamic_cast<b::ast::Identifier*>(node->left.get())) {
+                auto flagIt = dropFlags.find(target->name);
+                if (flagIt != dropFlags.end()) {
+                    for (auto scope = ownedScopes.rbegin(); scope != ownedScopes.rend(); ++scope) {
+                        bool found = false;
+                        for (const auto& owned : *scope) {
+                            if (owned.flag == flagIt->second) {
+                                emitDrop(owned);
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found) {
+                            break;
+                        }
+                    }
+                    builder->CreateStore(llvm::ConstantInt::getTrue(*context), flagIt->second);
+                }
+            }
+        }
 
         builder->CreateStore(rhsValue, targetPtr);
         lastValue = rhsValue;
@@ -3287,11 +5694,44 @@ void CodeGenerator::visit(b::ast::BinaryOp* node) {
 
     checkEnumOperands(node);
 
+    if (node->op == b::ast::BinaryOp::Operator::LOGICAL_AND ||
+        node->op == b::ast::BinaryOp::Operator::LOGICAL_OR) {
+        emitShortCircuit(node);
+        return;
+    }
+
+    b::ast::Type leftArcType;
+    b::ast::Type rightArcType;
+    bool leftKnown = inferType(node->left.get(), leftArcType);
+    bool rightKnown = inferType(node->right.get(), rightArcType);
+
     node->left->accept(this);
     llvm::Value* lhs = lastValue;
 
     node->right->accept(this);
     llvm::Value* rhs = lastValue;
+
+    if ((node->op == b::ast::BinaryOp::Operator::PLUS ||
+         node->op == b::ast::BinaryOp::Operator::MINUS) &&
+        (lhs->getType()->isPointerTy() || rhs->getType()->isPointerTy())) {
+        if (!leftKnown || !rightKnown) {
+            throw b::CompilerException("Cannot determine the pointed-to type for pointer arithmetic");
+        }
+        lastValue = emitPointerArithmetic(node, lhs, rhs, leftArcType, rightArcType);
+        return;
+    }
+
+    if ((node->op == b::ast::BinaryOp::Operator::DIVIDE ||
+         node->op == b::ast::BinaryOp::Operator::MODULO)) {
+        if (auto* divisor = llvm::dyn_cast<llvm::ConstantInt>(rhs)) {
+            if (divisor->isZero()) {
+                throw b::CompilerException(
+                    node->op == b::ast::BinaryOp::Operator::DIVIDE
+                        ? "Division by zero"
+                        : "Remainder by zero");
+            }
+        }
+    }
 
     if (lhs->getType()->isPointerTy() && rhs->getType()->isIntegerTy()) {
         if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(rhs)) {
@@ -3404,6 +5844,12 @@ void CodeGenerator::visit(b::ast::UnaryOp* node) {
     }
 
     if (node->op == b::ast::UnaryOp::Operator::ADDRESS_OF) {
+        b::ast::Type operandType;
+        if (inferType(node->operand.get(), operandType) &&
+            (operandType.isOwned() || operandType.isBorrow() || operandType.slice)) {
+            node->operand->accept(this);
+            return;
+        }
         lastValue = addressOf(node->operand.get(), nullptr);
         return;
     }
@@ -3442,12 +5888,17 @@ void CodeGenerator::visit(b::ast::CastExpr* node) {
 
     if (sourceType->isIntegerTy() && targetLLVMType->isIntegerTy()) {
         if (sourceType->getIntegerBitWidth() < targetLLVMType->getIntegerBitWidth()) {
-            lastValue = builder->CreateSExt(value, targetLLVMType);
+
+            lastValue = sourceType->isIntegerTy(1)
+                            ? builder->CreateZExt(value, targetLLVMType)
+                            : builder->CreateSExt(value, targetLLVMType);
         } else {
             lastValue = builder->CreateTrunc(value, targetLLVMType);
         }
     } else if (sourceType->isIntegerTy() && targetLLVMType->isFloatingPointTy()) {
-        lastValue = builder->CreateSIToFP(value, targetLLVMType);
+        lastValue = sourceType->isIntegerTy(1)
+                        ? builder->CreateUIToFP(value, targetLLVMType)
+                        : builder->CreateSIToFP(value, targetLLVMType);
     } else if (sourceType->isFloatingPointTy() && targetLLVMType->isIntegerTy()) {
         lastValue = builder->CreateFPToSI(value, targetLLVMType);
     } else if (sourceType->isFloatingPointTy() && targetLLVMType->isFloatingPointTy()) {
@@ -3468,6 +5919,38 @@ void CodeGenerator::visit(b::ast::CastExpr* node) {
 }
 
 void CodeGenerator::visit(b::ast::FunctionCall* node) {
+
+    if (node->isIndirect()) {
+        b::ast::Type calleeType;
+        if (!inferType(node->callee.get(), calleeType) || !calleeType.isFunctionPointer()) {
+            throw b::CompilerException("This expression is not a function pointer, so it cannot be called");
+        }
+        auto typedefIt = funcPointerTypedefs.find(calleeType.funcPointerTypedefName);
+        if (typedefIt == funcPointerTypedefs.end()) {
+            throw b::CompilerException("Unknown function pointer type '" +
+                                       calleeType.funcPointerTypedefName + "'");
+        }
+        llvm::FunctionType* indirectType = typedefIt->second;
+
+        node->callee->accept(this);
+        llvm::Value* target = lastValue;
+
+        if (node->arguments.size() != indirectType->getNumParams()) {
+            throw b::CompilerException("'" + calleeType.funcPointerTypedefName + "' expects " +
+                                       std::to_string(indirectType->getNumParams()) +
+                                       " argument(s), got " + std::to_string(node->arguments.size()));
+        }
+
+        std::vector<llvm::Value*> indirectArgs;
+        for (size_t i = 0; i < node->arguments.size(); ++i) {
+            node->arguments[i]->accept(this);
+            indirectArgs.push_back(coerceValue(lastValue, indirectType->getParamType(i)));
+        }
+
+        lastValue = builder->CreateCall(indirectType, target, indirectArgs);
+        return;
+    }
+
     if (node->functionName == "print" || node->functionName == "println") {
         llvm::Function* printfFunc = module->getFunction("printf");
         if (!printfFunc) {
@@ -3487,8 +5970,15 @@ void CodeGenerator::visit(b::ast::FunctionCall* node) {
             } else if (argType->isIntegerTy(1)) {
                 format += "%d";
                 argValue = builder->CreateZExt(argValue, llvm::Type::getInt32Ty(*context));
+            } else if (argType->isIntegerTy(8)) {
+
+                format += "%c";
+                argValue = builder->CreateSExt(argValue, llvm::Type::getInt32Ty(*context));
             } else if (argType->isIntegerTy()) {
                 format += "%d";
+                if (argType->getIntegerBitWidth() < 32) {
+                    argValue = builder->CreateSExt(argValue, llvm::Type::getInt32Ty(*context));
+                }
             } else if (argType->isFloatingPointTy()) {
                 format += "%f";
                 if (!argType->isDoubleTy()) {
@@ -3512,15 +6002,35 @@ void CodeGenerator::visit(b::ast::FunctionCall* node) {
         return;
     }
 
+    if (node->functionName == "len") {
+        if (node->arguments.size() != 1) {
+            throw b::CompilerException("len expects exactly 1 argument");
+        }
+        b::ast::Type argumentType;
+        if (!inferType(node->arguments[0].get(), argumentType) || !argumentType.slice) {
+            throw b::CompilerException("len expects a slice");
+        }
+        if (argumentType.fixedLength >= 0) {
+            lastValue = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context),
+                                               argumentType.fixedLength);
+            return;
+        }
+        node->arguments[0]->accept(this);
+        lastValue = builder->CreateIntCast(
+            builder->CreateCall(module->getFunction("b_len"), {lastValue}),
+            llvm::Type::getInt32Ty(*context), true);
+        return;
+    }
+
     if (node->functionName == "itoa") {
         if (node->arguments.size() != 1) {
             throw std::runtime_error("itoa expects exactly 1 argument");
         }
 
-        llvm::Function* mallocFunc = module->getFunction("malloc");
+        llvm::Function* allocator = module->getFunction("b_alloc");
         llvm::Function* sprintfFunc = module->getFunction("sprintf");
-        if (!mallocFunc || !sprintfFunc) {
-            throw std::runtime_error("malloc/sprintf not declared");
+        if (!allocator || !sprintfFunc) {
+            throw b::CompilerException("Internal error: itoa needs the allocator runtime");
         }
 
         node->arguments[0]->accept(this);
@@ -3529,8 +6039,8 @@ void CodeGenerator::visit(b::ast::FunctionCall* node) {
             intValue = builder->CreateIntCast(intValue, llvm::Type::getInt32Ty(*context), true);
         }
 
-        llvm::Value* bufSize = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 12);
-        llvm::Value* buffer = builder->CreateCall(mallocFunc, {bufSize});
+        llvm::Value* bufSize = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context), 12);
+        llvm::Value* buffer = builder->CreateCall(allocator, {bufSize});
 
         llvm::Value* formatStr = builder->CreateGlobalString("%d");
         builder->CreateCall(sprintfFunc, {buffer, formatStr, intValue});
@@ -3538,6 +6048,8 @@ void CodeGenerator::visit(b::ast::FunctionCall* node) {
         lastValue = buffer;
         return;
     }
+
+    std::string calleeName = node->functionName;
 
     llvm::Value* calleeValue = nullptr;
     llvm::FunctionType* funcType = nullptr;
@@ -3553,7 +6065,7 @@ void CodeGenerator::visit(b::ast::FunctionCall* node) {
         llvm::Value* varPtr = getVariable(node->functionName);
         calleeValue = builder->CreateLoad(llvm::PointerType::get(*context, 0), varPtr);
     } else {
-        func = module->getFunction(node->functionName);
+        func = module->getFunction(calleeName);
         if (!func) {
             throw b::CompilerException("Undefined function: " + node->functionName);
         }
@@ -3571,6 +6083,14 @@ void CodeGenerator::visit(b::ast::FunctionCall* node) {
             for (size_t i = 0; i < node->arguments.size(); ++i) {
                 checkEnumCompatible(paramIt->second[i], node->arguments[i].get(),
                                     "argument " + std::to_string(i + 1) + " of " + node->functionName);
+                b::ast::Type argumentType;
+                if (inferType(node->arguments[i].get(), argumentType) &&
+                    !assignableFrom(paramIt->second[i], argumentType)) {
+                    throw b::CompilerException(
+                        "Argument " + std::to_string(i + 1) + " of " + node->functionName +
+                        " expects '" + b::ast::typeToString(paramIt->second[i]) + "' but got '" +
+                        b::ast::typeToString(argumentType) + "'");
+                }
             }
         }
     }
@@ -3584,14 +6104,11 @@ void CodeGenerator::visit(b::ast::FunctionCall* node) {
         if (i < funcType->getNumParams()) {
             llvm::Type* paramType = funcType->getParamType(i);
             if (argValue->getType() != paramType) {
-                if (argValue->getType()->isIntegerTy() && paramType->isIntegerTy()) {
-                    argValue = builder->CreateIntCast(argValue, paramType, true);
-                } else if (argValue->getType()->isIntegerTy() && paramType->isPointerTy()) {
-                    if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(argValue)) {
-                        if (constInt->isZero()) {
-                            argValue = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(paramType));
-                        }
-                    }
+                argValue = coerceValue(argValue, paramType);
+                if (argValue->getType() != paramType) {
+                    throw b::CompilerException(
+                        "Argument " + std::to_string(i + 1) + " of " + node->functionName +
+                        " has the wrong type and cannot be converted implicitly");
                 }
             }
         } else if (funcType->isVarArg()) {
@@ -3618,7 +6135,7 @@ bool CodeGenerator::inferType(b::ast::Expression* expr, b::ast::Type& outType) {
                 type.enumName = literal->enumName;
                 break;
             case b::ast::Literal::Kind::FLOAT:
-                type.base = b::ast::PrimitiveType::FLOAT;
+                type.base = b::ast::PrimitiveType::DOUBLE;
                 break;
             case b::ast::Literal::Kind::STRING:
                 type.base = b::ast::PrimitiveType::CHAR;
@@ -3626,6 +6143,11 @@ bool CodeGenerator::inferType(b::ast::Expression* expr, b::ast::Type& outType) {
                 break;
             case b::ast::Literal::Kind::BOOLEAN:
                 type.base = b::ast::PrimitiveType::BOOL;
+                break;
+            case b::ast::Literal::Kind::NONE:
+                type.base = b::ast::PrimitiveType::VOID;
+                type.pointerLevel = 1;
+                type.optional = true;
                 break;
         }
         outType = type;
@@ -3635,6 +6157,16 @@ bool CodeGenerator::inferType(b::ast::Expression* expr, b::ast::Type& outType) {
     if (dynamic_cast<b::ast::SizeofExpr*>(expr)) {
         outType = b::ast::Type();
         outType.base = b::ast::PrimitiveType::INT;
+        return true;
+    }
+
+    if (auto* allocation = dynamic_cast<b::ast::NewExpr*>(expr)) {
+        outType = allocation->type;
+        return true;
+    }
+
+    if (auto* allocation = dynamic_cast<b::ast::NewSliceExpr*>(expr)) {
+        outType = allocation->type;
         return true;
     }
 
@@ -3653,6 +6185,18 @@ bool CodeGenerator::inferType(b::ast::Expression* expr, b::ast::Type& outType) {
     }
 
     if (auto* call = dynamic_cast<b::ast::FunctionCall*>(expr)) {
+        if (call->isIndirect()) {
+            b::ast::Type calleeType;
+            if (!inferType(call->callee.get(), calleeType) || !calleeType.isFunctionPointer()) {
+                return false;
+            }
+            auto returnIt = funcPointerReturnTypes.find(calleeType.funcPointerTypedefName);
+            if (returnIt == funcPointerReturnTypes.end()) {
+                return false;
+            }
+            outType = returnIt->second;
+            return true;
+        }
         auto it = functionReturnTypes.find(call->functionName);
         if (it != functionReturnTypes.end()) {
             outType = it->second;
@@ -3683,7 +6227,7 @@ bool CodeGenerator::inferType(b::ast::Expression* expr, b::ast::Type& outType) {
         if (!inferType(array->array.get(), arrayType) || arrayType.pointerLevel == 0) {
             return false;
         }
-        outType = derefType(arrayType);
+        outType = arrayType.slice ? elementTypeOf(arrayType) : derefType(arrayType);
         return true;
     }
 
@@ -3701,7 +6245,14 @@ bool CodeGenerator::inferType(b::ast::Expression* expr, b::ast::Type& outType) {
                     return false;
                 }
                 outType = operandType;
-                outType.pointerLevel++;
+                if (operandType.isOwned() || operandType.isBorrow() || operandType.slice) {
+                    outType.ownership = unary->mutableBorrow ? b::ast::Ownership::MutBorrow
+                                                             : b::ast::Ownership::SharedBorrow;
+                } else {
+                    outType.ownership = unary->mutableBorrow ? b::ast::Ownership::MutBorrow
+                                                             : b::ast::Ownership::SharedBorrow;
+                    outType.pointerLevel++;
+                }
                 return true;
             case b::ast::UnaryOp::Operator::NOT:
                 outType = b::ast::Type();
@@ -3755,6 +6306,11 @@ llvm::Value* CodeGenerator::addressOf(b::ast::Expression* expr, b::ast::Type* ou
             throw b::CompilerException("'" + b::ast::typeToString(objectType) +
                                        "' is not a struct, so it has no field '" + member->member + "'");
         }
+        if (objectType.optional) {
+            throw b::CompilerException("Cannot reach field '" + member->member + "' through '" +
+                                       b::ast::typeToString(objectType) +
+                                       "' without unwrapping it with 'if some'");
+        }
         if (objectType.pointerLevel > 1) {
             throw b::CompilerException("Cannot access field '" + member->member +
                                        "' through a multi-level pointer");
@@ -3799,6 +6355,10 @@ llvm::Value* CodeGenerator::addressOf(b::ast::Expression* expr, b::ast::Type* ou
         if (!inferType(array->array.get(), arrayType)) {
             throw b::CompilerException("Cannot determine the element type of this index expression");
         }
+        if (arrayType.optional) {
+            throw b::CompilerException("Cannot index '" + b::ast::typeToString(arrayType) +
+                                       "' without unwrapping it with 'if some'");
+        }
         if (arrayType.pointerLevel == 0) {
             throw b::CompilerException("Cannot index a value of type '" +
                                        b::ast::typeToString(arrayType) + "'");
@@ -3810,10 +6370,39 @@ llvm::Value* CodeGenerator::addressOf(b::ast::Expression* expr, b::ast::Type* ou
         array->index->accept(this);
         llvm::Value* indexValue = lastValue;
 
-        b::ast::Type elementType = derefType(arrayType);
+        b::ast::Type elementType = arrayType.slice ? elementTypeOf(arrayType) : derefType(arrayType);
         if (outType) {
             *outType = elementType;
         }
+
+        if (arrayType.slice) {
+            llvm::Value* wide =
+                builder->CreateIntCast(indexValue, llvm::Type::getInt64Ty(*context), true);
+            bool proven = false;
+            if (arrayType.fixedLength >= 0) {
+                if (auto* constant = llvm::dyn_cast<llvm::ConstantInt>(wide)) {
+                    int64_t at = constant->getSExtValue();
+                    if (at < 0 || at >= arrayType.fixedLength) {
+                        throw b::CompilerException("Index " + std::to_string(at) +
+                                                   " is outside '" +
+                                                   b::ast::typeToString(arrayType) + "'");
+                    }
+                    proven = true;
+                }
+            }
+            if (!proven) {
+                llvm::Value* length = nullptr;
+                if (arrayType.fixedLength >= 0) {
+                    length = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context),
+                                                    arrayType.fixedLength);
+                } else {
+                    length = builder->CreateCall(module->getFunction("b_len"), {basePtr});
+                }
+                emitBoundsCheck(wide, length);
+            }
+            indexValue = wide;
+        }
+
         return builder->CreateGEP(arcTypeToLLVM(elementType), basePtr, indexValue);
     }
 
@@ -3848,10 +6437,11 @@ llvm::Value* CodeGenerator::coerceValue(llvm::Value* value, llvm::Type* targetTy
     }
 
     if (sourceType->isIntegerTy() && targetType->isIntegerTy()) {
-        return builder->CreateIntCast(value, targetType, true);
+        return builder->CreateIntCast(value, targetType, !sourceType->isIntegerTy(1));
     }
     if (sourceType->isIntegerTy() && targetType->isFloatingPointTy()) {
-        return builder->CreateSIToFP(value, targetType);
+        return sourceType->isIntegerTy(1) ? builder->CreateUIToFP(value, targetType)
+                                          : builder->CreateSIToFP(value, targetType);
     }
     if (sourceType->isFloatingPointTy() && targetType->isIntegerTy()) {
         return builder->CreateFPToSI(value, targetType);
@@ -3886,27 +6476,50 @@ void CodeGenerator::visit(b::ast::VariableDecl* node) {
     llvm::Type* type = arcTypeToLLVM(node->type);
 
     if (node->arraySize > 0) {
-        b::ast::Type elementType = derefType(node->type);
-        llvm::Type* elementLLVMType = arcTypeToLLVM(elementType);
-        llvm::Value* storage = builder->CreateAlloca(
-            llvm::ArrayType::get(elementLLVMType, node->arraySize)
-        );
+        b::ast::Type sliceType = node->type;
+        sliceType.slice = true;
+        sliceType.fixedLength = node->arraySize;
 
-        llvm::AllocaInst* pointerSlot = builder->CreateAlloca(type);
-        builder->CreateStore(storage, pointerSlot);
+        b::ast::Type elementType = elementTypeOf(sliceType);
+        llvm::Type* elementLLVMType = arcTypeToLLVM(elementType);
+        llvm::Type* i64Type = llvm::Type::getInt64Ty(*context);
+
+        llvm::StructType* backing = llvm::StructType::get(
+            *context, {i64Type, i64Type, llvm::ArrayType::get(elementLLVMType, node->arraySize)});
+        llvm::Value* storage = createEntryAlloca(backing, node->name + ".store");
+
+        llvm::Value* lengthSlot = builder->CreateStructGEP(backing, storage, 1);
+        builder->CreateStore(llvm::ConstantInt::get(i64Type, node->arraySize), lengthSlot);
+
+        llvm::Value* data = builder->CreateStructGEP(backing, storage, 2);
+        llvm::AllocaInst* pointerSlot = createEntryAlloca(type, node->name);
+        builder->CreateStore(data, pointerSlot);
 
         setVariable(node->name, pointerSlot);
         variableTypes[node->name] = type;
-        arcVariableTypes[node->name] = node->type;
+        arcVariableTypes[node->name] = sliceType;
         return;
     }
 
-    llvm::AllocaInst* alloca = builder->CreateAlloca(type);
+    llvm::AllocaInst* alloca = createEntryAlloca(type, node->name);
 
     if (node->initializer) {
         node->initializer->accept(this);
         checkEnumCompatible(node->type, node->initializer.get(), "variable '" + node->name + "'");
+        b::ast::Type sourceType;
+        if (inferType(node->initializer.get(), sourceType) &&
+            !assignableFrom(node->type, sourceType)) {
+            throw b::CompilerException("Cannot initialize '" + node->name + "' of type '" +
+                                       b::ast::typeToString(node->type) + "' with '" +
+                                       b::ast::typeToString(sourceType) + "'");
+        }
         builder->CreateStore(coerceValue(lastValue, type), alloca);
+    } else if (node->type.isOwned()) {
+        builder->CreateStore(llvm::Constant::getNullValue(type), alloca);
+    }
+
+    if (node->type.isOwned()) {
+        registerOwnedLocal(node->name, node->type, alloca, node->initializer != nullptr);
     }
 
     setVariable(node->name, alloca);
@@ -3937,8 +6550,10 @@ void CodeGenerator::visit(b::ast::ReturnStmt* node) {
             }
         }
 
+        emitScopeDrops(0);
         builder->CreateRet(retVal);
     } else {
+        emitScopeDrops(0);
         builder->CreateRetVoid();
     }
 }
@@ -3948,12 +6563,72 @@ void CodeGenerator::visit(b::ast::ExpressionStmt* node) {
 }
 
 void CodeGenerator::visit(b::ast::Block* node) {
+    pushScope();
+    ownedScopes.emplace_back();
+    std::unordered_set<std::string> outerConsts = constVariables;
     for (const auto& stmt : node->statements) {
         if (blockIsTerminated()) {
             break;
         }
         stmt->accept(this);
     }
+    if (!blockIsTerminated()) {
+        emitScopeDrops(ownedScopes.size() - 1);
+    }
+    ownedScopes.pop_back();
+    constVariables = std::move(outerConsts);
+    popScope();
+}
+
+void CodeGenerator::visit(b::ast::IfSomeStmt* node) {
+    b::ast::Type sourceType;
+    if (!inferType(node->source.get(), sourceType) || !sourceType.optional) {
+        throw b::CompilerException("'if some' needs an optional value to unwrap");
+    }
+
+    node->source->accept(this);
+    llvm::Value* candidate = lastValue;
+    llvm::Type* ptrType = llvm::PointerType::get(*context, 0);
+    llvm::Value* present = builder->CreateICmpNE(
+        candidate, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrType)));
+
+    llvm::BasicBlock* someBlock = llvm::BasicBlock::Create(*context, "some", currentFunction);
+    llvm::BasicBlock* noneBlock = nullptr;
+    llvm::BasicBlock* mergeBlock = llvm::BasicBlock::Create(*context, "someend", currentFunction);
+
+    if (node->elseBranch) {
+        noneBlock = llvm::BasicBlock::Create(*context, "none", currentFunction);
+        builder->CreateCondBr(present, someBlock, noneBlock);
+    } else {
+        builder->CreateCondBr(present, someBlock, mergeBlock);
+    }
+
+    builder->SetInsertPoint(someBlock);
+    pushScope();
+    b::ast::Type boundType = sourceType;
+    boundType.optional = false;
+    boundType.ownership = node->mutableBinding ? b::ast::Ownership::MutBorrow
+                                               : b::ast::Ownership::SharedBorrow;
+    llvm::AllocaInst* slot = createEntryAlloca(ptrType, node->binding);
+    builder->CreateStore(candidate, slot);
+    setVariable(node->binding, slot);
+    variableTypes[node->binding] = ptrType;
+    arcVariableTypes[node->binding] = boundType;
+    node->thenBranch->accept(this);
+    popScope();
+    if (!blockIsTerminated()) {
+        builder->CreateBr(mergeBlock);
+    }
+
+    if (noneBlock) {
+        builder->SetInsertPoint(noneBlock);
+        node->elseBranch->accept(this);
+        if (!blockIsTerminated()) {
+            builder->CreateBr(mergeBlock);
+        }
+    }
+
+    builder->SetInsertPoint(mergeBlock);
 }
 
 void CodeGenerator::visit(b::ast::IfStmt* node) {
@@ -4012,6 +6687,7 @@ void CodeGenerator::visit(b::ast::ForStmt* node) {
 
     breakTargets.push_back(afterBlock);
     continueTargets.push_back(incrementBlock);
+    loopOwnedDepth.push_back(ownedScopes.size());
 
     builder->SetInsertPoint(bodyBlock);
     node->body->accept(this);
@@ -4019,6 +6695,7 @@ void CodeGenerator::visit(b::ast::ForStmt* node) {
         builder->CreateBr(incrementBlock);
     }
 
+    loopOwnedDepth.pop_back();
     breakTargets.pop_back();
     continueTargets.pop_back();
 
@@ -4046,6 +6723,7 @@ void CodeGenerator::visit(b::ast::WhileStmt* node) {
 
     breakTargets.push_back(endBlock);
     continueTargets.push_back(condBlock);
+    loopOwnedDepth.push_back(ownedScopes.size());
 
     builder->SetInsertPoint(bodyBlock);
     node->body->accept(this);
@@ -4053,6 +6731,7 @@ void CodeGenerator::visit(b::ast::WhileStmt* node) {
         builder->CreateBr(condBlock);
     }
 
+    loopOwnedDepth.pop_back();
     breakTargets.pop_back();
     continueTargets.pop_back();
 
@@ -4064,6 +6743,7 @@ void CodeGenerator::visit(b::ast::BreakStmt* node) {
     if (breakTargets.empty()) {
         throw std::runtime_error("'break' used outside of a loop");
     }
+    emitScopeDrops(loopOwnedDepth.empty() ? 0 : loopOwnedDepth.back());
     builder->CreateBr(breakTargets.back());
 }
 
@@ -4072,6 +6752,7 @@ void CodeGenerator::visit(b::ast::ContinueStmt* node) {
     if (continueTargets.empty()) {
         throw std::runtime_error("'continue' used outside of a loop");
     }
+    emitScopeDrops(loopOwnedDepth.empty() ? 0 : loopOwnedDepth.back());
     builder->CreateBr(continueTargets.back());
 }
 
@@ -4123,42 +6804,64 @@ void CodeGenerator::visit(b::ast::SwitchStmt* node) {
 
     node->condition->accept(this);
     llvm::Value* switchValue = lastValue;
+    if (!switchValue->getType()->isIntegerTy()) {
+        throw b::CompilerException("switch requires an integer, char, bool or enum value");
+    }
+
+    std::vector<llvm::ConstantInt*> caseValues(node->cases.size(), nullptr);
+    std::unordered_set<int64_t> seenValues;
+    for (size_t i = 0; i < node->cases.size(); ++i) {
+        if (node->cases[i].isDefault) {
+            continue;
+        }
+        llvm::Constant* folded = evalConstantExpr(node->cases[i].value.get(), "a case label");
+        auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(folded);
+        if (!constInt) {
+            throw b::CompilerException("A case label must be a constant integer, char or enum constant");
+        }
+        constInt = castConstantInt(constInt, switchValue->getType(), true);
+        if (!seenValues.insert(constInt->getSExtValue()).second) {
+            throw b::CompilerException("Duplicate case label " +
+                                       std::to_string(constInt->getSExtValue()) + " in switch");
+        }
+        caseValues[i] = constInt;
+    }
 
     llvm::BasicBlock* mergeBlock = llvm::BasicBlock::Create(*context, "switch.merge", currentFunction);
     llvm::SwitchInst* switchInst = builder->CreateSwitch(switchValue, mergeBlock, node->cases.size());
 
-    llvm::BasicBlock* defaultBlock = nullptr;
+    std::vector<llvm::BasicBlock*> caseBlocks;
+    caseBlocks.reserve(node->cases.size());
+    for (size_t i = 0; i < node->cases.size(); ++i) {
+        caseBlocks.push_back(llvm::BasicBlock::Create(*context, "switch.case", currentFunction));
+    }
 
-    for (const auto& caseItem : node->cases) {
-        llvm::BasicBlock* caseBlock = llvm::BasicBlock::Create(*context, "switch.case", currentFunction);
-        builder->SetInsertPoint(caseBlock);
-
-        breakTargets.push_back(mergeBlock);
-
-        for (const auto& stmt : caseItem.statements) {
-            stmt->accept(this);
-        }
-
-        if (!blockIsTerminated()) {
-            builder->CreateBr(mergeBlock);
-        }
-
-        breakTargets.pop_back();
-
-        if (caseItem.isDefault) {
-            defaultBlock = caseBlock;
-            switchInst->setDefaultDest(caseBlock);
+    for (size_t i = 0; i < node->cases.size(); ++i) {
+        if (node->cases[i].isDefault) {
+            switchInst->setDefaultDest(caseBlocks[i]);
         } else {
-            caseItem.value->accept(this);
-            llvm::Value* caseValue = lastValue;
-            if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(caseValue)) {
-                switchInst->addCase(constInt, caseBlock);
-            }
+            switchInst->addCase(caseValues[i], caseBlocks[i]);
         }
     }
 
-    if (!defaultBlock) {
-        switchInst->setDefaultDest(mergeBlock);
+    for (size_t i = 0; i < node->cases.size(); ++i) {
+        builder->SetInsertPoint(caseBlocks[i]);
+        breakTargets.push_back(mergeBlock);
+
+        pushScope();
+        for (const auto& stmt : node->cases[i].statements) {
+            if (blockIsTerminated()) {
+                break;
+            }
+            stmt->accept(this);
+        }
+        popScope();
+
+        breakTargets.pop_back();
+
+        if (!blockIsTerminated()) {
+            builder->CreateBr(i + 1 < caseBlocks.size() ? caseBlocks[i + 1] : mergeBlock);
+        }
     }
 
     builder->SetInsertPoint(mergeBlock);
@@ -4178,6 +6881,12 @@ void CodeGenerator::visit(b::ast::FunctionDecl* node) {
     variables.clear();
     variableTypes.clear();
     arcVariableTypes.clear();
+    dropFlags.clear();
+    ownedScopes.clear();
+    loopOwnedDepth.clear();
+    ownedScopes.emplace_back();
+
+    constVariables = constGlobals;
 
     for (const auto& globalType : globalVariableTypes) {
         arcVariableTypes[globalType.first] = globalType.second;
@@ -4188,8 +6897,11 @@ void CodeGenerator::visit(b::ast::FunctionDecl* node) {
     for (const auto& param : node->parameters) {
         argIt->setName(param.name);
         llvm::Type* paramType = arcTypeToLLVM(param.type);
-        llvm::AllocaInst* alloca = builder->CreateAlloca(paramType);
+        llvm::AllocaInst* alloca = createEntryAlloca(paramType, param.name);
         builder->CreateStore(&*argIt, alloca);
+        if (param.type.isOwned() && node->dropsType.empty()) {
+            registerOwnedLocal(param.name, param.type, alloca, true);
+        }
         setVariable(param.name, alloca);
         arcVariableTypes[param.name] = param.type;
         variableTypes[param.name] = paramType;
@@ -4200,8 +6912,19 @@ void CodeGenerator::visit(b::ast::FunctionDecl* node) {
         node->body->accept(this);
     }
 
-    if (node->returnType.isVoid() && !blockIsTerminated()) {
-        builder->CreateRetVoid();
+    if (!blockIsTerminated()) {
+        llvm::BasicBlock* tail = builder->GetInsertBlock();
+        if (node->returnType.isVoid()) {
+            emitScopeDrops(0);
+            builder->CreateRetVoid();
+        } else if (tail != &function->getEntryBlock() && tail->hasNPredecessors(0)) {
+
+            builder->CreateUnreachable();
+        } else {
+            throw b::CompilerException("Function '" + node->name + "' must return a value of type '" +
+                                       b::ast::typeToString(node->returnType) +
+                                       "' on every path, but control can reach its closing brace");
+        }
     }
 }
 
@@ -4231,6 +6954,55 @@ void CodeGenerator::visit(b::ast::StructDecl* node) {
     structFieldTypes[node->name] = std::move(fieldTypeMap);
 }
 
+void CodeGenerator::checkStructCycles(b::ast::Program* program) {
+    std::unordered_map<std::string, std::vector<std::string>> containedByValue;
+    for (const auto& strct : program->structs) {
+        std::vector<std::string> nested;
+        for (const auto& field : strct->fields) {
+            if (field.type.isStruct() && field.type.pointerLevel == 0) {
+                nested.push_back(field.type.structName);
+            }
+        }
+        containedByValue[strct->name] = std::move(nested);
+    }
+
+    std::unordered_set<std::string> settled;
+    std::vector<std::string> path;
+    std::unordered_set<std::string> onPath;
+
+    std::function<void(const std::string&)> walk = [&](const std::string& name) {
+        if (settled.count(name)) {
+            return;
+        }
+        if (onPath.count(name)) {
+            std::string chain;
+            bool started = false;
+            for (const auto& step : path) {
+                if (step == name) started = true;
+                if (started) chain += step + " -> ";
+            }
+            throw b::CompilerException("Struct '" + name + "' contains itself by value (" + chain +
+                                       name + "); make one of the fields a pointer");
+        }
+        auto it = containedByValue.find(name);
+        if (it == containedByValue.end()) {
+            return;
+        }
+        onPath.insert(name);
+        path.push_back(name);
+        for (const auto& nested : it->second) {
+            walk(nested);
+        }
+        path.pop_back();
+        onPath.erase(name);
+        settled.insert(name);
+    };
+
+    for (const auto& entry : containedByValue) {
+        walk(entry.first);
+    }
+}
+
 void CodeGenerator::visit(b::ast::Program* node) {
     for (const auto& enumDecl : node->enums) {
         enumMembers[enumDecl.name] = enumDecl.constants;
@@ -4243,6 +7015,8 @@ void CodeGenerator::visit(b::ast::Program* node) {
         structTypes[strct->name] = llvm::StructType::create(*context, strct->name);
     }
 
+    checkStructCycles(node);
+
     for (const auto& strct : node->structs) {
         strct->accept(this);
     }
@@ -4254,6 +7028,7 @@ void CodeGenerator::visit(b::ast::Program* node) {
         }
         llvm::Type* returnType = arcTypeToLLVM(typedefDecl.returnType);
         funcPointerTypedefs[typedefDecl.name] = llvm::FunctionType::get(returnType, paramTypes, false);
+        funcPointerReturnTypes[typedefDecl.name] = typedefDecl.returnType;
     }
 
     for (const auto& globalVar : node->globalVariables) {
@@ -4266,19 +7041,29 @@ void CodeGenerator::visit(b::ast::Program* node) {
         if (globalVar.initializer) {
             checkEnumCompatible(globalVar.type, globalVar.initializer.get(),
                                 "global variable '" + globalVar.name + "'");
-            globalVar.initializer->accept(this);
-            initializer = llvm::dyn_cast<llvm::Constant>(lastValue);
-            if (!initializer) {
-                if (globalVar.type.base == b::ast::PrimitiveType::INT) {
-                    initializer = llvm::ConstantInt::get(llvmType, 0);
-                } else if (globalVar.type.base == b::ast::PrimitiveType::FLOAT ||
-                           globalVar.type.base == b::ast::PrimitiveType::DOUBLE) {
-                    initializer = llvm::ConstantFP::get(llvmType, 0.0);
-                } else if (globalVar.type.base == b::ast::PrimitiveType::BOOL) {
-                    initializer = llvm::ConstantInt::get(llvmType, 0);
-                } else {
-                    initializer = llvm::Constant::getNullValue(llvmType);
+            initializer = evalConstantExpr(globalVar.initializer.get(),
+                                           "the initializer of global '" + globalVar.name + "'");
+            if (initializer->getType() != llvmType) {
+                if (initializer->getType()->isIntegerTy() && llvmType->isIntegerTy()) {
+                    initializer = castConstantInt(llvm::cast<llvm::ConstantInt>(initializer),
+                                                  llvmType,
+                                                  !initializer->getType()->isIntegerTy(1));
+                } else if (initializer->getType()->isFloatingPointTy() && llvmType->isFloatingPointTy()) {
+                    initializer = llvm::ConstantFP::get(
+                        llvmType, llvm::cast<llvm::ConstantFP>(initializer)->getValueAPF().convertToDouble());
+                } else if (auto* asInt = llvm::dyn_cast<llvm::ConstantInt>(initializer)) {
+                    if (llvmType->isFloatingPointTy()) {
+                        initializer = llvm::ConstantFP::get(
+                            llvmType, static_cast<double>(asInt->getSExtValue()));
+                    } else if (llvmType->isPointerTy() && asInt->isZero()) {
+                        initializer = llvm::Constant::getNullValue(llvmType);
+                    }
                 }
+            }
+            if (initializer->getType() != llvmType) {
+                throw b::CompilerException("Global '" + globalVar.name + "' of type '" +
+                                           b::ast::typeToString(globalVar.type) +
+                                           "' cannot be initialized with this value");
             }
         } else {
             initializer = llvm::Constant::getNullValue(llvmType);
@@ -4290,6 +7075,8 @@ void CodeGenerator::visit(b::ast::Program* node) {
         globalVariableTypes[globalVar.name] = globalVar.type;
         if (globalVar.isConst) {
             constVariables.insert(globalVar.name);
+            constGlobals.insert(globalVar.name);
+            constGlobalValues[globalVar.name] = initializer;
         }
     }
 
@@ -4311,6 +7098,21 @@ void CodeGenerator::visit(b::ast::Program* node) {
             paramTypes.push_back(param.type);
         }
         functionParamTypes[func->name] = std::move(paramTypes);
+    }
+
+    for (const auto& func : node->functions) {
+        if (func->dropsType.empty()) {
+            continue;
+        }
+        if (!structTypes.count(func->dropsType)) {
+            throw b::CompilerException("'drop " + func->dropsType +
+                                       "' names a type that is not a struct");
+        }
+        if (userDropFunctions.count(func->dropsType)) {
+            throw b::CompilerException("Struct '" + func->dropsType +
+                                       "' already has a drop function");
+        }
+        userDropFunctions[func->dropsType] = module->getFunction(func->name);
     }
 
     for (const auto& func : node->functions) {
@@ -4338,6 +7140,8 @@ class ModuleLoader {
 public:
     std::vector<b::lexer::Token> load(const std::string& entryPath);
     const std::vector<std::string>& modules() const { return order; }
+    const std::vector<std::string>& cycles() const { return importCycles; }
+    const std::unordered_map<std::string, std::string>& sources() const { return moduleSources; }
 
 private:
     struct ImportRequest {
@@ -4349,10 +7153,16 @@ private:
     std::unordered_set<std::string> loading;
     std::vector<std::string> order;
     std::vector<b::lexer::Token> tokens;
+    std::vector<std::string> stackKeys;
+    std::vector<std::string> stackNames;
+    std::vector<std::string> importCycles;
+    std::unordered_map<std::string, std::string> moduleSources;
 
+    void recordCycle(const std::string& key);
     void loadFile(const std::string& path, const std::string& importedFrom, int importLine);
     static std::string resolve(const std::string& raw, const fs::path& importerDir);
     static std::string displayName(const fs::path& path);
+    static std::vector<fs::path> searchRoots();
 };
 
 std::string ModuleLoader::displayName(const fs::path& path) {
@@ -4364,6 +7174,53 @@ std::string ModuleLoader::displayName(const fs::path& path) {
     return relative.string();
 }
 
+void ModuleLoader::recordCycle(const std::string& key) {
+    auto it = std::find(stackKeys.begin(), stackKeys.end(), key);
+    if (it == stackKeys.end()) {
+        return;
+    }
+
+    size_t start = static_cast<size_t>(it - stackKeys.begin());
+    std::string chain;
+    for (size_t i = start; i < stackNames.size(); ++i) {
+        chain += stackNames[i] + " -> ";
+    }
+    chain += displayName(key);
+
+    if (std::find(importCycles.begin(), importCycles.end(), chain) == importCycles.end()) {
+        importCycles.push_back(chain);
+    }
+}
+
+std::vector<fs::path> ModuleLoader::searchRoots() {
+    std::vector<fs::path> roots;
+
+    if (const char* configured = std::getenv("B_PATH")) {
+        std::string value(configured);
+        size_t start = 0;
+        while (start <= value.size()) {
+            size_t stop = value.find(':', start);
+            std::string piece =
+                value.substr(start, stop == std::string::npos ? std::string::npos : stop - start);
+            if (!piece.empty()) {
+                roots.emplace_back(piece);
+            }
+            if (stop == std::string::npos) {
+                break;
+            }
+            start = stop + 1;
+        }
+    }
+
+    if (const char* home = std::getenv("HOME")) {
+        roots.push_back(fs::path(home) / ".b");
+    }
+    if (const char* profile = std::getenv("USERPROFILE")) {
+        roots.push_back(fs::path(profile) / ".b");
+    }
+    return roots;
+}
+
 std::string ModuleLoader::resolve(const std::string& raw, const fs::path& importerDir) {
     std::vector<fs::path> candidates;
     fs::path rawPath(raw);
@@ -4373,6 +7230,9 @@ std::string ModuleLoader::resolve(const std::string& raw, const fs::path& import
     } else {
         candidates.push_back(importerDir / rawPath);
         candidates.push_back(fs::current_path() / rawPath);
+        for (const auto& root : searchRoots()) {
+            candidates.push_back(root / rawPath);
+        }
     }
 
     size_t fixedCount = candidates.size();
@@ -4400,12 +7260,18 @@ void ModuleLoader::loadFile(const std::string& path, const std::string& imported
     fs::path canonicalPath = fs::weakly_canonical(fs::path(path), ec);
     std::string key = ec ? path : canonicalPath.string();
 
-    if (loaded.count(key) || loading.count(key)) {
+    if (loading.count(key)) {
+        recordCycle(key);
+        return;
+    }
+    if (loaded.count(key)) {
         return;
     }
     loading.insert(key);
 
     std::string name = displayName(key);
+    stackKeys.push_back(key);
+    stackNames.push_back(name);
     std::string source;
     try {
         source = readFile(key);
@@ -4416,6 +7282,8 @@ void ModuleLoader::loadFile(const std::string& path, const std::string& imported
         throw b::CompilerException("Cannot open module '" + path + "' imported from " +
                                    importedFrom + ":" + std::to_string(importLine));
     }
+
+    moduleSources[name] = source;
 
     std::vector<b::lexer::Token> fileTokens;
     try {
@@ -4466,14 +7334,19 @@ void ModuleLoader::loadFile(const std::string& path, const std::string& imported
     for (const auto& request : imports) {
         std::string resolved = resolve(request.path, importerDir);
         if (resolved.empty()) {
-            throw b::CompilerException("Cannot find module '" + request.path + "' imported from " +
-                                       name + ":" + std::to_string(request.line));
+            throw b::CompilerException(
+                "Cannot find module '" + request.path + "' imported from " + name + ":" +
+                std::to_string(request.line) +
+                "\n  searched next to the importing file, in the working directory, and in "
+                "$B_PATH and ~/.b");
         }
         loadFile(resolved, name, request.line);
     }
 
     tokens.insert(tokens.end(), kept.begin(), kept.end());
 
+    stackKeys.pop_back();
+    stackNames.pop_back();
     loading.erase(key);
     loaded.insert(key);
     order.push_back(name);
@@ -4484,10 +7357,834 @@ std::vector<b::lexer::Token> ModuleLoader::load(const std::string& entryPath) {
     loaded.clear();
     loading.clear();
     order.clear();
+    moduleSources.clear();
+    stackKeys.clear();
+    stackNames.clear();
+    importCycles.clear();
 
     loadFile(entryPath, "", 0);
     tokens.push_back(b::lexer::Token(b::lexer::TokenType::EOF_TOKEN, "", "", 0, 0));
     return tokens;
+}
+
+namespace b::modules {
+
+class NamespaceResolver {
+public:
+    std::vector<b::lexer::Token> resolve(std::vector<b::lexer::Token> input);
+    const std::vector<std::string>& namespaces() const { return declared; }
+
+private:
+    struct Scope {
+        std::unordered_set<std::string> names;
+        std::unordered_set<std::string> children;
+    };
+
+    struct Frame {
+        std::string qualified;
+        size_t depth;
+    };
+
+    struct UsingEntry {
+        std::string qualified;
+        size_t depth;
+        std::string file;
+    };
+
+    std::vector<b::lexer::Token> tokens;
+    std::unordered_map<std::string, Scope> scopes;
+    std::vector<std::string> declared;
+    std::unordered_map<size_t, std::string> declSites;
+    std::unordered_set<size_t> frozen;
+
+    std::vector<Frame> nsStack;
+    std::vector<UsingEntry> usings;
+    size_t depth = 0;
+
+    static std::string join(const std::string& scope, const std::string& name) {
+        return scope.empty() ? name : scope + "::" + name;
+    }
+    static std::string mangle(const std::string& qualified);
+
+    bool isType(size_t index, b::lexer::TokenType type) const {
+        return index < tokens.size() && tokens[index].type == type;
+    }
+    bool atDeclarationLevel() const {
+        return nsStack.empty() ? depth == 0 : depth == nsStack.back().depth + 1;
+    }
+    std::string currentScope() const {
+        return nsStack.empty() ? std::string() : nsStack.back().qualified;
+    }
+    Scope& scopeFor(const std::string& qualified) { return scopes[qualified]; }
+    const Scope* findScope(const std::string& qualified) const;
+
+    std::string at(size_t index) const;
+    size_t skipBalanced(size_t index, b::lexer::TokenType open, b::lexer::TokenType close) const;
+    size_t skipToSemicolon(size_t index) const;
+    std::vector<std::string> readPath(size_t& index) const;
+
+    void declare(const std::string& name, size_t nameIndex);
+    void closeNamespaces();
+    size_t openNamespace(size_t index);
+
+    void collect();
+    size_t collectStruct(size_t index);
+    size_t collectEnum(size_t index);
+    size_t collectTypedef(size_t index);
+    size_t collectFunctionOrGlobal(size_t index);
+    size_t skipDropDeclaration(size_t index);
+    size_t readTypeParams(size_t index, std::unordered_set<std::string>& out);
+    void freezeFieldNames(size_t from, size_t to);
+    void freezeMatching(size_t from, size_t to, const std::unordered_set<std::string>& names);
+    void checkCollisions() const;
+    void freezeInitializerFieldNames();
+
+    std::vector<b::lexer::Token> rewrite();
+    size_t applyUsing(size_t index);
+    size_t emitIdentifier(size_t index, std::vector<b::lexer::Token>& out);
+    std::string findBaseScope(const std::string& first, size_t index) const;
+    std::string resolveFrom(const std::string& base, const std::vector<std::string>& parts,
+                            size_t index) const;
+    std::string resolveNamespace(const std::vector<std::string>& parts, size_t index) const;
+    std::string resolveUnqualified(const std::string& name, size_t index) const;
+};
+
+std::string NamespaceResolver::mangle(const std::string& qualified) {
+    std::string flat;
+    flat.reserve(qualified.size());
+    for (size_t i = 0; i < qualified.size(); ++i) {
+        if (qualified[i] == ':' && i + 1 < qualified.size() && qualified[i + 1] == ':') {
+            flat += "__";
+            ++i;
+        } else {
+            flat += qualified[i];
+        }
+    }
+    return flat;
+}
+
+const NamespaceResolver::Scope* NamespaceResolver::findScope(const std::string& qualified) const {
+    auto it = scopes.find(qualified);
+    return it == scopes.end() ? nullptr : &it->second;
+}
+
+std::string NamespaceResolver::at(size_t index) const {
+    if (index >= tokens.size()) {
+        return "";
+    }
+    const b::lexer::Token& token = tokens[index];
+    std::string where = " (";
+    if (!token.file.empty()) {
+        where += token.file + ":";
+    }
+    where += "line " + std::to_string(token.line) + ")";
+    return where;
+}
+
+size_t NamespaceResolver::skipBalanced(size_t index, b::lexer::TokenType open,
+                                       b::lexer::TokenType close) const {
+    if (!isType(index, open)) {
+        return index;
+    }
+    size_t nesting = 0;
+    for (size_t i = index; i < tokens.size(); ++i) {
+        if (tokens[i].type == open) {
+            ++nesting;
+        } else if (tokens[i].type == close) {
+            --nesting;
+            if (nesting == 0) {
+                return i + 1;
+            }
+        } else if (tokens[i].type == b::lexer::TokenType::EOF_TOKEN) {
+            return i;
+        }
+    }
+    return tokens.size();
+}
+
+size_t NamespaceResolver::skipToSemicolon(size_t index) const {
+    size_t nesting = 0;
+    for (size_t i = index; i < tokens.size(); ++i) {
+        b::lexer::TokenType type = tokens[i].type;
+        if (type == b::lexer::TokenType::LBRACE) {
+            ++nesting;
+        } else if (type == b::lexer::TokenType::RBRACE) {
+            if (nesting == 0) {
+                return i;
+            }
+            --nesting;
+        } else if (type == b::lexer::TokenType::SEMICOLON && nesting == 0) {
+            return i + 1;
+        } else if (type == b::lexer::TokenType::EOF_TOKEN) {
+            return i;
+        }
+    }
+    return tokens.size();
+}
+
+std::vector<std::string> NamespaceResolver::readPath(size_t& index) const {
+    std::vector<std::string> parts;
+    while (isType(index, b::lexer::TokenType::IDENTIFIER)) {
+        parts.push_back(tokens[index].lexeme);
+        ++index;
+        if (!isType(index, b::lexer::TokenType::COLON_COLON)) {
+            break;
+        }
+        ++index;
+    }
+    return parts;
+}
+
+void NamespaceResolver::declare(const std::string& name, size_t nameIndex) {
+    std::string scope = currentScope();
+    scopeFor(scope).names.insert(name);
+    if (!scope.empty()) {
+        declSites[nameIndex] = mangle(join(scope, name));
+    } else {
+
+        frozen.insert(nameIndex);
+    }
+}
+
+void NamespaceResolver::closeNamespaces() {
+    while (!nsStack.empty() && nsStack.back().depth == depth) {
+        nsStack.pop_back();
+    }
+}
+
+size_t NamespaceResolver::openNamespace(size_t index) {
+    size_t i = index + 1;
+    std::vector<std::string> parts = readPath(i);
+    if (parts.empty()) {
+        throw b::CompilerException("Expected a name after 'namespace'" + at(index));
+    }
+    if (!isType(i, b::lexer::TokenType::LBRACE)) {
+        throw b::CompilerException("Expected '{' after namespace '" + parts.back() + "'" + at(i));
+    }
+    ++i;
+
+    std::string qualified = currentScope();
+    for (const auto& part : parts) {
+        std::string parent = qualified;
+        qualified = join(parent, part);
+        scopeFor(parent).children.insert(part);
+        scopeFor(qualified);
+        nsStack.push_back({qualified, depth});
+        if (std::find(declared.begin(), declared.end(), qualified) == declared.end()) {
+            declared.push_back(qualified);
+        }
+    }
+    ++depth;
+    return i;
+}
+
+size_t NamespaceResolver::readTypeParams(size_t index, std::unordered_set<std::string>& out) {
+    int angle = 0;
+    for (size_t i = index; i < tokens.size(); ++i) {
+        b::lexer::TokenType type = tokens[i].type;
+        if (type == b::lexer::TokenType::LESS) {
+            ++angle;
+        } else if (type == b::lexer::TokenType::GREATER) {
+            if (--angle <= 0) return i + 1;
+        } else if (type == b::lexer::TokenType::GREATER_GREATER) {
+            angle -= 2;
+            if (angle <= 0) return i + 1;
+        } else if (type == b::lexer::TokenType::IDENTIFIER) {
+            out.insert(tokens[i].lexeme);
+            frozen.insert(i);
+        } else if (type == b::lexer::TokenType::LBRACE ||
+                   type == b::lexer::TokenType::SEMICOLON ||
+                   type == b::lexer::TokenType::EOF_TOKEN) {
+            return i;
+        }
+    }
+    return tokens.size();
+}
+
+void NamespaceResolver::freezeFieldNames(size_t from, size_t to) {
+    size_t lastIdent = tokens.size();
+    int angle = 0;
+    for (size_t i = from; i < to && i < tokens.size(); ++i) {
+        switch (tokens[i].type) {
+            case b::lexer::TokenType::LESS:
+                ++angle;
+                break;
+            case b::lexer::TokenType::GREATER:
+                if (angle > 0) --angle;
+                break;
+            case b::lexer::TokenType::GREATER_GREATER:
+                angle = angle > 1 ? angle - 2 : 0;
+                break;
+            case b::lexer::TokenType::IDENTIFIER:
+                if (angle == 0) lastIdent = i;
+                break;
+            case b::lexer::TokenType::LBRACKET:
+            case b::lexer::TokenType::SEMICOLON:
+                if (lastIdent < tokens.size()) frozen.insert(lastIdent);
+                lastIdent = tokens.size();
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+void NamespaceResolver::freezeMatching(size_t from, size_t to,
+                                       const std::unordered_set<std::string>& names) {
+    if (names.empty()) {
+        return;
+    }
+    for (size_t i = from; i < to && i < tokens.size(); ++i) {
+        if (tokens[i].type == b::lexer::TokenType::IDENTIFIER && names.count(tokens[i].lexeme)) {
+            frozen.insert(i);
+        }
+    }
+}
+
+size_t NamespaceResolver::collectStruct(size_t index) {
+    size_t i = index + 1;
+    if (!isType(i, b::lexer::TokenType::IDENTIFIER)) {
+        return skipToSemicolon(index);
+    }
+    size_t nameIndex = i;
+    declare(tokens[i].lexeme, i);
+    ++i;
+
+    std::unordered_set<std::string> typeParams;
+    if (isType(i, b::lexer::TokenType::LESS)) {
+        i = readTypeParams(i, typeParams);
+    }
+    if (!isType(i, b::lexer::TokenType::LBRACE)) {
+        return skipToSemicolon(nameIndex);
+    }
+
+    size_t end = skipBalanced(i, b::lexer::TokenType::LBRACE, b::lexer::TokenType::RBRACE);
+    freezeFieldNames(i + 1, end > 0 ? end - 1 : 0);
+    freezeMatching(nameIndex, end, typeParams);
+    if (isType(end, b::lexer::TokenType::SEMICOLON)) {
+        ++end;
+    }
+    return end;
+}
+
+size_t NamespaceResolver::collectEnum(size_t index) {
+    size_t i = index + 1;
+    if (!isType(i, b::lexer::TokenType::IDENTIFIER)) {
+        return skipToSemicolon(index);
+    }
+    declare(tokens[i].lexeme, i);
+    ++i;
+    if (!isType(i, b::lexer::TokenType::LBRACE)) {
+        return skipToSemicolon(index);
+    }
+
+    size_t end = skipBalanced(i, b::lexer::TokenType::LBRACE, b::lexer::TokenType::RBRACE);
+    ++i;
+
+    while (i + 1 < end && isType(i, b::lexer::TokenType::IDENTIFIER)) {
+        declare(tokens[i].lexeme, i);
+        ++i;
+        if (isType(i, b::lexer::TokenType::EQUAL)) {
+            ++i;
+            if (isType(i, b::lexer::TokenType::MINUS)) ++i;
+            if (isType(i, b::lexer::TokenType::INTEGER)) ++i;
+        }
+        if (!isType(i, b::lexer::TokenType::COMMA)) {
+            break;
+        }
+        ++i;
+    }
+
+    if (isType(end, b::lexer::TokenType::SEMICOLON)) {
+        ++end;
+    }
+    return end;
+}
+
+size_t NamespaceResolver::collectTypedef(size_t index) {
+    size_t end = skipToSemicolon(index);
+    for (size_t i = index; i + 2 < end; ++i) {
+        if (tokens[i].type == b::lexer::TokenType::LPAREN &&
+            tokens[i + 1].type == b::lexer::TokenType::STAR &&
+            tokens[i + 2].type == b::lexer::TokenType::IDENTIFIER) {
+            declare(tokens[i + 2].lexeme, i + 2);
+            break;
+        }
+    }
+    return end;
+}
+
+size_t NamespaceResolver::skipDropDeclaration(size_t index) {
+    size_t i = index;
+    while (i < tokens.size() && !isType(i, b::lexer::TokenType::LPAREN)) {
+        if (isType(i, b::lexer::TokenType::EOF_TOKEN)) {
+            return i;
+        }
+        ++i;
+    }
+    i = skipBalanced(i, b::lexer::TokenType::LPAREN, b::lexer::TokenType::RPAREN);
+    if (isType(i, b::lexer::TokenType::LBRACE)) {
+        i = skipBalanced(i, b::lexer::TokenType::LBRACE, b::lexer::TokenType::RBRACE);
+    }
+    return i > index ? i : index + 1;
+}
+
+size_t NamespaceResolver::collectFunctionOrGlobal(size_t index) {
+    size_t i = index;
+    if (isType(i, b::lexer::TokenType::KW_PUB)) {
+        ++i;
+    }
+    if (isType(i, b::lexer::TokenType::KW_CONST)) {
+        ++i;
+    }
+    if (isType(i, b::lexer::TokenType::KW_OWN)) {
+        ++i;
+    } else if (isType(i, b::lexer::TokenType::AMPERSAND)) {
+        ++i;
+        if (isType(i, b::lexer::TokenType::KW_MUT)) {
+            ++i;
+        }
+    }
+    if (isType(i, b::lexer::TokenType::LBRACKET)) {
+        i = skipBalanced(i, b::lexer::TokenType::LBRACKET, b::lexer::TokenType::RBRACKET);
+        if (isType(i, b::lexer::TokenType::QUESTION)) {
+            ++i;
+        }
+    }
+
+    size_t nameIndex = tokens.size();
+    size_t terminator = tokens.size();
+    int angle = 0;
+    for (size_t k = i; k < tokens.size(); ++k) {
+        b::lexer::TokenType type = tokens[k].type;
+        if (type == b::lexer::TokenType::LESS) {
+            ++angle;
+        } else if (type == b::lexer::TokenType::GREATER) {
+            if (angle > 0) --angle;
+        } else if (type == b::lexer::TokenType::GREATER_GREATER) {
+            angle = angle > 1 ? angle - 2 : 0;
+        } else if (type == b::lexer::TokenType::IDENTIFIER) {
+            if (angle == 0) nameIndex = k;
+        } else if (type == b::lexer::TokenType::SEMICOLON ||
+                   type == b::lexer::TokenType::LBRACE ||
+                   type == b::lexer::TokenType::RBRACE ||
+                   type == b::lexer::TokenType::EOF_TOKEN) {
+            terminator = k;
+            break;
+        } else if (angle == 0 && (type == b::lexer::TokenType::LPAREN ||
+                                  type == b::lexer::TokenType::EQUAL ||
+                                  type == b::lexer::TokenType::LBRACKET)) {
+            terminator = k;
+            break;
+        }
+    }
+
+    if (nameIndex < tokens.size()) {
+        declare(tokens[nameIndex].lexeme, nameIndex);
+    }
+
+    std::unordered_set<std::string> typeParams;
+    if (nameIndex + 1 < tokens.size() && isType(nameIndex + 1, b::lexer::TokenType::LESS)) {
+        readTypeParams(nameIndex + 1, typeParams);
+    }
+
+    size_t end;
+    if (terminator >= tokens.size()) {
+        end = tokens.size();
+    } else if (tokens[terminator].type == b::lexer::TokenType::LPAREN) {
+        size_t afterParams =
+            skipBalanced(terminator, b::lexer::TokenType::LPAREN, b::lexer::TokenType::RPAREN);
+        if (isType(afterParams, b::lexer::TokenType::LBRACE)) {
+            end = skipBalanced(afterParams, b::lexer::TokenType::LBRACE,
+                               b::lexer::TokenType::RBRACE);
+        } else {
+            end = skipToSemicolon(afterParams);
+        }
+    } else if (tokens[terminator].type == b::lexer::TokenType::RBRACE) {
+        end = terminator;
+    } else {
+        end = skipToSemicolon(terminator);
+    }
+
+    freezeMatching(index, end, typeParams);
+    return end > index ? end : index + 1;
+}
+
+void NamespaceResolver::collect() {
+    nsStack.clear();
+    depth = 0;
+
+    size_t i = 0;
+    while (i < tokens.size()) {
+        b::lexer::TokenType type = tokens[i].type;
+
+        if (type == b::lexer::TokenType::EOF_TOKEN) {
+            ++i;
+            continue;
+        }
+
+        if (!atDeclarationLevel()) {
+            if (type == b::lexer::TokenType::LBRACE) {
+                ++depth;
+            } else if (type == b::lexer::TokenType::RBRACE && depth > 0) {
+                --depth;
+                closeNamespaces();
+            }
+            ++i;
+            continue;
+        }
+
+        if (type == b::lexer::TokenType::KW_NAMESPACE) {
+            i = openNamespace(i);
+            continue;
+        }
+        if (type == b::lexer::TokenType::KW_USING) {
+            i = skipToSemicolon(i);
+            continue;
+        }
+        if (type == b::lexer::TokenType::RBRACE) {
+            if (depth > 0) {
+                --depth;
+                closeNamespaces();
+            }
+            ++i;
+            continue;
+        }
+
+        if (type == b::lexer::TokenType::KW_DROP) {
+            i = skipDropDeclaration(i);
+            continue;
+        }
+
+        size_t declStart = i;
+        if (type == b::lexer::TokenType::KW_PUB && declStart + 1 < tokens.size()) {
+            type = tokens[declStart + 1].type;
+            ++declStart;
+        }
+
+        size_t next;
+        if (type == b::lexer::TokenType::KW_STRUCT) {
+            next = collectStruct(declStart);
+        } else if (type == b::lexer::TokenType::KW_ENUM) {
+            next = collectEnum(declStart);
+        } else if (type == b::lexer::TokenType::KW_TYPEDEF) {
+            next = collectTypedef(declStart);
+        } else {
+            next = collectFunctionOrGlobal(i);
+        }
+        i = next > i ? next : i + 1;
+    }
+
+    if (!nsStack.empty()) {
+        throw b::CompilerException("Unterminated namespace '" + nsStack.back().qualified + "'");
+    }
+}
+
+void NamespaceResolver::freezeInitializerFieldNames() {
+    for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+        if (tokens[i].type != b::lexer::TokenType::KW_NEW) {
+            continue;
+        }
+        size_t brace = i + 1;
+        while (brace < tokens.size() && !isType(brace, b::lexer::TokenType::LBRACE)) {
+            if (isType(brace, b::lexer::TokenType::SEMICOLON) ||
+                isType(brace, b::lexer::TokenType::LPAREN) ||
+                isType(brace, b::lexer::TokenType::EOF_TOKEN)) {
+                break;
+            }
+            ++brace;
+        }
+        if (!isType(brace, b::lexer::TokenType::LBRACE)) {
+            continue;
+        }
+
+        size_t end = skipBalanced(brace, b::lexer::TokenType::LBRACE, b::lexer::TokenType::RBRACE);
+        int depth = 0;
+        for (size_t k = brace; k + 1 < end; ++k) {
+            if (tokens[k].type == b::lexer::TokenType::LBRACE) {
+                ++depth;
+            } else if (tokens[k].type == b::lexer::TokenType::RBRACE) {
+                --depth;
+            } else if (depth == 1 && tokens[k].type == b::lexer::TokenType::IDENTIFIER &&
+                       isType(k + 1, b::lexer::TokenType::COLON)) {
+                frozen.insert(k);
+            }
+        }
+    }
+}
+
+void NamespaceResolver::checkCollisions() const {
+    std::unordered_map<std::string, std::string> seen;
+    for (const auto& entry : scopes) {
+        for (const auto& name : entry.second.names) {
+            std::string qualified = join(entry.first, name);
+            std::string flat = mangle(qualified);
+            auto it = seen.find(flat);
+            if (it != seen.end() && it->second != qualified) {
+                throw b::CompilerException("'" + qualified + "' and '" + it->second +
+                                           "' both flatten to '" + flat +
+                                           "'; rename one of them");
+            }
+            seen.emplace(flat, qualified);
+        }
+    }
+}
+
+std::string NamespaceResolver::findBaseScope(const std::string& first, size_t index) const {
+    for (auto it = nsStack.rbegin(); it != nsStack.rend(); ++it) {
+        const Scope* scope = findScope(it->qualified);
+        if (scope && scope->children.count(first)) {
+            return it->qualified;
+        }
+    }
+
+    const Scope* global = findScope("");
+    if (global && global->children.count(first)) {
+        return "";
+    }
+
+    for (auto it = usings.rbegin(); it != usings.rend(); ++it) {
+        const Scope* scope = findScope(it->qualified);
+        if (scope && scope->children.count(first)) {
+            return it->qualified;
+        }
+    }
+
+    throw b::CompilerException("Unknown namespace '" + first + "'" + at(index));
+}
+
+std::string NamespaceResolver::resolveFrom(const std::string& base,
+                                           const std::vector<std::string>& parts,
+                                           size_t index) const {
+    std::string current = base;
+    for (size_t k = 0; k + 1 < parts.size(); ++k) {
+        const Scope* scope = findScope(current);
+        if (!scope || !scope->children.count(parts[k])) {
+            throw b::CompilerException("Namespace '" + (current.empty() ? "(global)" : current) +
+                                       "' has no namespace '" + parts[k] + "'" + at(index));
+        }
+        current = join(current, parts[k]);
+    }
+
+    const std::string& last = parts.back();
+    const Scope* scope = findScope(current);
+    if (!scope || !scope->names.count(last)) {
+        throw b::CompilerException("'" + last + "' is not declared in namespace '" +
+                                   (current.empty() ? "(global)" : current) + "'" + at(index));
+    }
+    return current.empty() ? last : mangle(join(current, last));
+}
+
+std::string NamespaceResolver::resolveNamespace(const std::vector<std::string>& parts,
+                                                size_t index) const {
+    std::string current = findBaseScope(parts[0], index);
+    for (const auto& part : parts) {
+        const Scope* scope = findScope(current);
+        if (!scope || !scope->children.count(part)) {
+            throw b::CompilerException("Namespace '" + (current.empty() ? "(global)" : current) +
+                                       "' has no namespace '" + part + "'" + at(index));
+        }
+        current = join(current, part);
+    }
+    return current;
+}
+
+std::string NamespaceResolver::resolveUnqualified(const std::string& name, size_t index) const {
+    for (auto it = nsStack.rbegin(); it != nsStack.rend(); ++it) {
+        const Scope* scope = findScope(it->qualified);
+        if (scope && scope->names.count(name)) {
+            return mangle(join(it->qualified, name));
+        }
+    }
+
+    const Scope* global = findScope("");
+    if (global && global->names.count(name)) {
+        return "";
+    }
+
+    std::string found;
+    std::string foundIn;
+    for (auto it = usings.rbegin(); it != usings.rend(); ++it) {
+        const Scope* scope = findScope(it->qualified);
+        if (!scope || !scope->names.count(name)) {
+            continue;
+        }
+        std::string candidate = mangle(join(it->qualified, name));
+        if (found.empty()) {
+            found = candidate;
+            foundIn = it->qualified;
+        } else if (found != candidate) {
+            throw b::CompilerException("'" + name + "' is ambiguous: it is declared in '" +
+                                       foundIn + "' and in '" + it->qualified + "'" + at(index));
+        }
+    }
+    return found;
+}
+
+size_t NamespaceResolver::applyUsing(size_t index) {
+    size_t i = index + 1;
+    if (!isType(i, b::lexer::TokenType::KW_NAMESPACE)) {
+        throw b::CompilerException("Expected 'namespace' after 'using'" + at(index));
+    }
+    ++i;
+
+    std::vector<std::string> parts = readPath(i);
+    if (parts.empty()) {
+        throw b::CompilerException("Expected a namespace name after 'using namespace'" + at(index));
+    }
+    if (!isType(i, b::lexer::TokenType::SEMICOLON)) {
+        throw b::CompilerException("Expected ';' after 'using namespace'" + at(i));
+    }
+    ++i;
+
+    usings.push_back({resolveNamespace(parts, index), depth, tokens[index].file});
+    return i;
+}
+
+size_t NamespaceResolver::emitIdentifier(size_t index, std::vector<b::lexer::Token>& out) {
+    b::lexer::Token token = tokens[index];
+
+    auto site = declSites.find(index);
+    if (site != declSites.end()) {
+        token.lexeme = site->second;
+        token.value = site->second;
+        out.push_back(token);
+        return index + 1;
+    }
+
+    if (frozen.count(index)) {
+        out.push_back(token);
+        return index + 1;
+    }
+
+    if (index > 0 && (tokens[index - 1].type == b::lexer::TokenType::DOT ||
+                      tokens[index - 1].type == b::lexer::TokenType::ARROW)) {
+        out.push_back(token);
+        return index + 1;
+    }
+
+    if (isType(index + 1, b::lexer::TokenType::COLON_COLON)) {
+        size_t next = index;
+        std::vector<std::string> parts = readPath(next);
+        std::string flat = resolveFrom(findBaseScope(parts[0], index), parts, index);
+        token.lexeme = flat;
+        token.value = flat;
+        out.push_back(token);
+        return next;
+    }
+
+    std::string flat = resolveUnqualified(token.lexeme, index);
+    if (!flat.empty()) {
+        token.lexeme = flat;
+        token.value = flat;
+    }
+    out.push_back(token);
+    return index + 1;
+}
+
+std::vector<b::lexer::Token> NamespaceResolver::rewrite() {
+    std::vector<b::lexer::Token> out;
+    out.reserve(tokens.size());
+
+    nsStack.clear();
+    usings.clear();
+    depth = 0;
+    std::string currentFile;
+
+    size_t i = 0;
+    while (i < tokens.size()) {
+        const b::lexer::Token& token = tokens[i];
+
+        if (!token.file.empty() && token.file != currentFile) {
+            currentFile = token.file;
+            while (!usings.empty() && usings.back().file != currentFile) {
+                usings.pop_back();
+            }
+        }
+
+        if (token.type == b::lexer::TokenType::KW_NAMESPACE && atDeclarationLevel()) {
+            i = openNamespace(i);
+            continue;
+        }
+
+        if (token.type == b::lexer::TokenType::KW_USING) {
+            i = applyUsing(i);
+            continue;
+        }
+
+        if (token.type == b::lexer::TokenType::COLON_COLON) {
+
+            size_t next = i + 1;
+            std::vector<std::string> parts = readPath(next);
+            if (!parts.empty()) {
+                b::lexer::Token renamed = tokens[next - 1];
+                std::string flat = resolveFrom("", parts, i);
+                renamed.lexeme = flat;
+                renamed.value = flat;
+                out.push_back(renamed);
+                i = next;
+                continue;
+            }
+        }
+
+        if (token.type == b::lexer::TokenType::LBRACE) {
+            ++depth;
+        } else if (token.type == b::lexer::TokenType::RBRACE) {
+            if (!nsStack.empty() && depth == nsStack.back().depth + 1) {
+                --depth;
+                closeNamespaces();
+                while (!usings.empty() && usings.back().depth > depth) {
+                    usings.pop_back();
+                }
+                ++i;
+                continue;
+            }
+            if (depth > 0) {
+                --depth;
+            }
+            while (!usings.empty() && usings.back().depth > depth) {
+                usings.pop_back();
+            }
+        }
+
+        if (token.type == b::lexer::TokenType::IDENTIFIER) {
+            i = emitIdentifier(i, out);
+            continue;
+        }
+
+        out.push_back(token);
+        ++i;
+    }
+
+    return out;
+}
+
+std::vector<b::lexer::Token> NamespaceResolver::resolve(std::vector<b::lexer::Token> input) {
+    tokens = std::move(input);
+    scopes.clear();
+    declared.clear();
+    declSites.clear();
+    frozen.clear();
+
+    bool usesNamespaces = false;
+    for (const auto& token : tokens) {
+        if (token.type == b::lexer::TokenType::KW_NAMESPACE ||
+            token.type == b::lexer::TokenType::KW_USING ||
+            token.type == b::lexer::TokenType::COLON_COLON) {
+            usesNamespaces = true;
+            break;
+        }
+    }
+    if (!usesNamespaces) {
+        return std::move(tokens);
+    }
+
+    freezeInitializerFieldNames();
+    collect();
+    checkCollisions();
+    return rewrite();
+}
+
 }
 
 void printUsage(const char* programName) {
@@ -4506,6 +8203,14 @@ public:
 
     void visit(b::ast::SizeofExpr* node) override {
         std::cout << "Sizeof(" << b::ast::typeToString(node->targetType) << ")";
+    }
+
+    void visit(b::ast::NewExpr* node) override {
+        std::cout << "New(" << b::ast::typeToString(node->type) << ")";
+    }
+
+    void visit(b::ast::NewSliceExpr* node) override {
+        std::cout << "NewSlice(" << b::ast::typeToString(node->type) << ")";
     }
 
     void visit(b::ast::Identifier* node) override {
@@ -4565,6 +8270,10 @@ public:
     void visit(b::ast::IfStmt* node) override {
         (void)node;
         std::cout << "If";
+    }
+
+    void visit(b::ast::IfSomeStmt* node) override {
+        std::cout << "IfSome(" << node->binding << ")";
     }
 
     void visit(b::ast::ForStmt* node) override {
@@ -4646,20 +8355,40 @@ int main(int argc, char* argv[]) {
     bool debugMode = (argc > 2 && std::string(argv[2]) == "--debug");
 
     try {
-        std::cout << "[1/4] Loading modules..." << std::endl;
+        b::diag::Reporter reporter;
+
+        std::cout << "[1/6] Loading modules..." << std::endl;
         ModuleLoader loader;
         auto tokens = loader.load(filepath);
+        for (const auto& entry : loader.sources()) {
+            reporter.addSource(entry.first, entry.second);
+        }
 
-        std::cout << "[2/4] Lexing..." << std::endl;
+        std::cout << "[2/6] Lexing..." << std::endl;
         std::cout << "      Modules: " << loader.modules().size() << std::endl;
         if (debugMode) {
             for (const auto& moduleName : loader.modules()) {
                 std::cout << "        " << moduleName << std::endl;
             }
         }
+        if (debugMode) {
+            for (const auto& cycle : loader.cycles()) {
+                std::cerr << "      Import cycle: " << cycle << std::endl;
+            }
+        }
         std::cout << "      Tokens: " << tokens.size() - 1 << std::endl;
 
-        std::cout << "[3/4] Parsing..." << std::endl;
+        std::cout << "[3/6] Resolving namespaces..." << std::endl;
+        b::modules::NamespaceResolver resolver;
+        tokens = resolver.resolve(std::move(tokens));
+        std::cout << "      Namespaces: " << resolver.namespaces().size() << std::endl;
+        if (debugMode) {
+            for (const auto& name : resolver.namespaces()) {
+                std::cout << "        " << name << std::endl;
+            }
+        }
+
+        std::cout << "[4/6] Parsing..." << std::endl;
         b::parser::Parser parser(tokens);
         auto program = parser.parse();
         std::cout << "      Functions: " << program->functions.size() << std::endl;
@@ -4671,7 +8400,17 @@ int main(int argc, char* argv[]) {
             std::cout << std::endl;
         }
 
-        std::cout << "[4/4] Code generation..." << std::endl;
+        std::cout << "[5/6] Checking..." << std::endl;
+        b::sema::Analyzer analyzer(reporter);
+        analyzer.run(program.get());
+        if (!reporter.empty()) {
+            reporter.print(std::cerr);
+        }
+        if (reporter.failed()) {
+            return 1;
+        }
+
+        std::cout << "[6/6] Code generation..." << std::endl;
 
         b::codegen::CodeGenerator codegen;
 
@@ -4715,4 +8454,3 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 }
-

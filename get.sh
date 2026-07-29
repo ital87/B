@@ -182,4 +182,3 @@ else
     do_install
     reload_shell
 fi
-

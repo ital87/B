@@ -5,7 +5,7 @@ enum Level {
     HIGH
 };
 
-void report(Level level, Vec2* v) {
+void report(Level level, &Vec2 v) {
     switch (level) {
         case LOW:
             print("low:  ");

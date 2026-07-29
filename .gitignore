@@ -1,10 +1,8 @@
-# Build directories
 build/
 cmake-build-*/
 out/
 dist/
 
-# Compiled binaries
 b
 *.o
 *.obj
@@ -15,13 +13,11 @@ b
 *.dll
 *.exe
 
-# CMake
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
 
-# IDE
 .vscode/
 .idea/
 *.swp
@@ -30,16 +26,13 @@ Makefile
 .DS_Store
 *.code-workspace
 
-# Temporary files
 *.tmp
 *.bak
 *.log
 
-# LLVM artifacts
 *.ll
 *.bc
 
-# Compiled test programs
 minimal
 test2
 test3
@@ -48,10 +41,17 @@ add
 factorial
 test_param
 
-# Compiled examples
 examples/hello
 examples/generics
 examples/enums
 examples/linked_list
 examples/project/main
+examples/modules/main
 
+/hello
+/generics
+/enums
+/linked_list
+/main
+
+b_stdlib_probe.txt

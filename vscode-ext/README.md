@@ -1,15 +1,15 @@
-# Arc Language Support for VS Code
+# B Language Support for VS Code
 
-This extension adds syntax highlighting and language support for the Arc programming language in Visual Studio Code.
+This extension adds syntax highlighting and language support for the B programming language in Visual Studio Code.
 
 ## Features
 
-- **Syntax Highlighting**: Recognizes and colorizes Arc language constructs
-  - Keywords (types, control flow, declarations)
+- **Syntax Highlighting**: Recognizes and colorizes B language constructs
+  - Keywords (types, ownership, control flow, declarations)
   - Strings and escape sequences
   - Numbers (integers and floats)
   - Comments (line and block)
-  - Operators and punctuation
+  - Operators and punctuation, including `::` and `?`
 
 - **Smart Indentation**: Automatic indentation for braces and control structures
 
@@ -17,17 +17,13 @@ This extension adds syntax highlighting and language support for the Arc program
 
 ## Installation
 
-### From VS Code Marketplace (Once Published)
-
-Search for "Arc Language Support" in the VS Code Extensions marketplace.
-
 ### Manual Installation
 
 1. Copy the `vscode-ext` folder to your VS Code extensions directory:
    - **Linux/Mac**: `~/.vscode/extensions/`
    - **Windows**: `%USERPROFILE%\.vscode\extensions\`
 
-2. Rename the folder to `arc-language-<version>`
+2. Rename the folder to `b-language-<version>`
 
 3. Restart VS Code
 
@@ -35,26 +31,26 @@ Search for "Arc Language Support" in the VS Code Extensions marketplace.
 
 ```bash
 cd vscode-ext
-npm install  # if dependencies are added later
-code --install-extension . 
+code --install-extension .
 ```
 
 ## Supported File Types
 
-- `.arc` - Arc source code files
+- `.b` - B source code files
 
 ## Syntax Highlighting Categories
 
-| Category | Color (Light Theme) | Examples |
-|----------|---|----------|
-| Keywords (Type) | Blue | `int`, `float`, `bool`, `void` |
-| Keywords (Control) | Orange | `if`, `else`, `for`, `while`, `return` |
-| Keywords (Declaration) | Purple | `struct`, `enum`, `fn` |
-| Keywords (Constant) | Green | `true`, `false` |
-| Strings | Red | `"hello"`, `'world'` |
-| Numbers | Cyan | `42`, `3.14` |
-| Comments | Gray | `// comment`, `/* block */` |
-| Operators | White | `+`, `-`, `==`, `&&`, etc. |
+| Category | Examples |
+|----------|----------|
+| Keywords (Type) | `int`, `float`, `bool`, `void`, `own`, `mut` |
+| Keywords (Control) | `if`, `else`, `for`, `while`, `return`, `switch`, `some` |
+| Keywords (Declaration) | `struct`, `enum`, `typedef`, `const`, `namespace`, `drop` |
+| Keywords (Module) | `import`, `using`, `pub` |
+| Operators | `sizeof`, `new`, `len` |
+| Constants | `true`, `false`, `none` |
+| Strings | `"hello"`, `'w'` |
+| Numbers | `42`, `3.14` |
+| Comments | `// comment`, `/* block */` |
 
 ## Configuration
 
@@ -66,7 +62,7 @@ To customize colors, add rules to your VS Code `settings.json`:
 "editor.tokenColorCustomizations": {
   "textMateRules": [
     {
-      "scope": "keyword.type.arc",
+      "scope": "keyword.type.b",
       "settings": {
         "foreground": "#0000FF"
       }
@@ -77,9 +73,8 @@ To customize colors, add rules to your VS Code `settings.json`:
 
 ## Contributing
 
-Report issues or suggest improvements on the [Arc GitHub repository](https://github.com/ital87/arc).
+Report issues or suggest improvements on the [B GitHub repository](https://github.com/ital87/B).
 
 ## License
 
-MIT License - See the main Arc repository for details.
-
+MIT License - See the main B repository for details.

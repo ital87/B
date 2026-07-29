@@ -1,5 +1,12 @@
 #Requires -Version 5.1
 
+Write-Host "B does not currently support Windows." -ForegroundColor Red
+Write-Host "Its runtime allocator and I/O issue Linux syscalls directly, so a Windows"
+Write-Host "build would produce programs that fault on the first allocation."
+Write-Host "See the Platform Support section of the README."
+exit 1
+
+
 $ErrorActionPreference = "Stop"
 
 Write-Host "=========================================="
@@ -152,8 +159,6 @@ if (Test-Path $TargetExe) {
     try {
         Rename-Item -Path $TargetExe -NewName "b.exe.old" -Force -ErrorAction Stop
     } catch {
-        # Currently running as b.exe (e.g. via b --update); renaming it out
-        # of the way still succeeds on NTFS even while the process is alive.
     }
 }
 
@@ -186,4 +191,3 @@ Write-Host "Compile a B file:"
 Write-Host "     b examples\hello.b"
 Write-Host ""
 Write-Host "(PATH updated for this session. Open a new terminal to pick it up everywhere.)"
-

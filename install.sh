@@ -184,7 +184,16 @@ if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
     chown -R "$REAL_USER":"$REAL_USER" "$REAL_HOME/.b"
 fi
 
+STD_DIR="$REAL_HOME/.b/std"
+rm -rf "$STD_DIR"
+mkdir -p "$STD_DIR"
+cp "$SCRIPT_DIR/std/"*.b "$STD_DIR/" 2>/dev/null || true
+if [ -n "$SUDO_USER" ]; then
+    chown -R "$SUDO_USER" "$REAL_HOME/.b" 2>/dev/null || true
+fi
+
 echo "✓ B compiler installed to: $INSTALL_DIR/b"
+echo "✓ Standard library installed to: $STD_DIR"
 echo
 
 update_shell_config() {
@@ -244,4 +253,3 @@ reload_shell() {
 }
 
 reload_shell
-

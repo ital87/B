@@ -1,5 +1,10 @@
 #Requires -Version 5.1
 
+Write-Host "B does not currently support Windows." -ForegroundColor Red
+Write-Host "See the Platform Support section of the README."
+exit 1
+
+
 param(
     [string]$Action = ""
 )
@@ -128,4 +133,3 @@ if ((Test-Path (Join-Path $RepoDir ".git")) -and (Test-Path (Join-Path $BinDir "
 } else {
     Invoke-Install
 }
-
